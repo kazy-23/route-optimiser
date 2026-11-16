@@ -50,7 +50,7 @@ def get_connection_string() -> str:
         )
 
     return (
-        "DRIVER={ODBC Driver 18 for SQL Server};"
+        "DRIVER={" + os.getenv("DB_DRIVER", "ODBC Driver 18 for SQL Server") + "};"
         f"SERVER=tcp:{server},1433;"
         f"DATABASE={database};"
         f"UID={quote_odbc(username)};"
