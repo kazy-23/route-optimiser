@@ -1,0 +1,3773 @@
+/*
+STANDALONE DATABASE BUILD + SYNTHETIC SEED + 75% UTILISATION SCENARIO
+For a NEW, EMPTY Azure SQL database. Does not rely on the previous six-table script.
+Creates all tables, six geographical groups, 30 lockers, locker capacities by compartment size, 1,000 base synthetic parcels,
+movement history, daily metrics, a starter forecast and a live capacity view, then adds a synthetic 75% utilisation scenario.
+All data is fictional and for demonstration only.
+Assumption: each parcel uses exactly one compartment of the matching size.
+*/
+
+
+SET NOCOUNT ON;
+
+CREATE TABLE dbo.Region (
+ RegionID INT NOT NULL PRIMARY KEY,
+ RegionName NVARCHAR(100) NOT NULL UNIQUE
+);
+
+CREATE TABLE dbo.Locker (
+ LockerID INT NOT NULL PRIMARY KEY,
+ LockerCode NVARCHAR(50) NOT NULL UNIQUE,
+ LockerName NVARCHAR(150) NOT NULL,
+ RegionID INT NOT NULL,
+ Latitude DECIMAL(9,6) NULL,
+ Longitude DECIMAL(9,6) NULL,
+ IsActive BIT NOT NULL CONSTRAINT DF_Locker_IsActive DEFAULT 1,
+ CONSTRAINT FK_Locker_Region FOREIGN KEY (RegionID) REFERENCES dbo.Region(RegionID)
+);
+
+CREATE TABLE dbo.LockerCompartment (
+ LockerID INT NOT NULL,
+ CompartmentSize NVARCHAR(10) NOT NULL,
+ TotalCompartments INT NOT NULL CHECK (TotalCompartments >= 0),
+ CONSTRAINT PK_LockerCompartment PRIMARY KEY (LockerID, CompartmentSize),
+ CONSTRAINT FK_Compartment_Locker FOREIGN KEY (LockerID) REFERENCES dbo.Locker(LockerID),
+ CONSTRAINT CK_Compartment_Size CHECK (CompartmentSize IN ('Small','Medium','Large'))
+);
+
+CREATE TABLE dbo.Parcel (
+ ParcelID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+ ParcelCode NVARCHAR(30) NOT NULL UNIQUE,
+ ParcelSize NVARCHAR(10) NOT NULL CHECK (ParcelSize IN ('Small','Medium','Large')),
+ CreatedAt DATETIME2 NOT NULL,
+ ExpectedDeliveryAt DATETIME2 NOT NULL,
+ DeliveredAt DATETIME2 NULL,
+ CollectedAt DATETIME2 NULL,
+ Status NVARCHAR(20) NOT NULL CHECK (Status IN ('InTransit','AtLocker','Collected','Returned')),
+ CurrentLockerID INT NULL,
+ DestinationRegionID INT NOT NULL,
+ LastStatusAt DATETIME2 NOT NULL,
+ CONSTRAINT FK_Parcel_CurrentLocker FOREIGN KEY (CurrentLockerID) REFERENCES dbo.Locker(LockerID),
+ CONSTRAINT FK_Parcel_DestinationRegion FOREIGN KEY (DestinationRegionID) REFERENCES dbo.Region(RegionID),
+ CONSTRAINT CK_Parcel_StatusLocker CHECK (
+   (Status='AtLocker' AND CurrentLockerID IS NOT NULL) OR
+   (Status<>'AtLocker' AND CurrentLockerID IS NULL)
+ )
+);
+
+CREATE TABLE dbo.ParcelMovement (
+ MovementID BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+ ParcelID INT NOT NULL,
+ FromLockerID INT NULL,
+ ToLockerID INT NULL,
+ EventType NVARCHAR(20) NOT NULL CHECK (EventType IN ('Loaded','Transferred','Collected','Dispatched')),
+ EventAt DATETIME2 NOT NULL,
+ Notes NVARCHAR(250) NULL,
+ StraightLineDistanceKm DECIMAL(10,2) NULL,
+ EstimatedRoadDistanceKm DECIMAL(10,2) NULL,
+ EstimatedTransportCostEUR DECIMAL(10,2) NULL,
+ CONSTRAINT FK_Movement_Parcel FOREIGN KEY (ParcelID) REFERENCES dbo.Parcel(ParcelID),
+ CONSTRAINT FK_Movement_FromLocker FOREIGN KEY (FromLockerID) REFERENCES dbo.Locker(LockerID),
+ CONSTRAINT FK_Movement_ToLocker FOREIGN KEY (ToLockerID) REFERENCES dbo.Locker(LockerID)
+);
+
+CREATE TABLE dbo.TransportCostSettings (
+ SettingID TINYINT NOT NULL PRIMARY KEY CHECK (SettingID = 1),
+ RoadDistanceFactor DECIMAL(5,2) NOT NULL CHECK (RoadDistanceFactor >= 1.00),
+ CostPerKmEUR DECIMAL(10,4) NOT NULL CHECK (CostPerKmEUR >= 0),
+ FixedHandlingCostEUR DECIMAL(10,2) NOT NULL CHECK (FixedHandlingCostEUR >= 0),
+ AssumptionNotes NVARCHAR(500) NOT NULL
+);
+
+CREATE TABLE dbo.DailyLockerMetrics (
+ LockerID INT NOT NULL,
+ MetricDate DATE NOT NULL,
+ ParcelsReceived INT NOT NULL DEFAULT 0 CHECK (ParcelsReceived >= 0),
+ ParcelsCollected INT NOT NULL DEFAULT 0 CHECK (ParcelsCollected >= 0),
+ OccupiedSmall INT NOT NULL DEFAULT 0 CHECK (OccupiedSmall >= 0),
+ OccupiedMedium INT NOT NULL DEFAULT 0 CHECK (OccupiedMedium >= 0),
+ OccupiedLarge INT NOT NULL DEFAULT 0 CHECK (OccupiedLarge >= 0),
+ CONSTRAINT PK_DailyLockerMetrics PRIMARY KEY (LockerID, MetricDate),
+ CONSTRAINT FK_DailyMetrics_Locker FOREIGN KEY (LockerID) REFERENCES dbo.Locker(LockerID)
+);
+
+CREATE TABLE dbo.ForecastRun (
+ ForecastRunID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+ CreatedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+ ModelName NVARCHAR(100) NOT NULL,
+ ModelVersion NVARCHAR(50) NULL,
+ ForecastHorizonDays INT NOT NULL CHECK (ForecastHorizonDays > 0),
+ DataThroughDate DATE NULL
+);
+
+CREATE TABLE dbo.LockerForecast (
+ ForecastID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+ ForecastRunID INT NOT NULL,
+ LockerID INT NOT NULL,
+ ForecastDate DATE NOT NULL,
+ PredictedSmallOccupancy DECIMAL(10,2) NULL,
+ PredictedMediumOccupancy DECIMAL(10,2) NULL,
+ PredictedLargeOccupancy DECIMAL(10,2) NULL,
+ RiskLevel NVARCHAR(20) NOT NULL CHECK (RiskLevel IN ('Low','Medium','High','Critical')),
+ CONSTRAINT FK_Forecast_Run FOREIGN KEY (ForecastRunID) REFERENCES dbo.ForecastRun(ForecastRunID),
+ CONSTRAINT FK_Forecast_Locker FOREIGN KEY (LockerID) REFERENCES dbo.Locker(LockerID),
+ CONSTRAINT UQ_LockerForecast UNIQUE (ForecastRunID, LockerID, ForecastDate)
+);
+
+CREATE TABLE dbo.Recommendation (
+ RecommendationID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+ ForecastRunID INT NOT NULL,
+ LockerID INT NOT NULL,
+ CreatedAt DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+ RecommendationText NVARCHAR(500) NOT NULL,
+ Priority NVARCHAR(20) NOT NULL CHECK (Priority IN ('Low','Medium','High','Critical')),
+ Status NVARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (Status IN ('Pending','Accepted','Rejected','Completed')),
+ CONSTRAINT FK_Recommendation_Run FOREIGN KEY (ForecastRunID) REFERENCES dbo.ForecastRun(ForecastRunID),
+ CONSTRAINT FK_Recommendation_Locker FOREIGN KEY (LockerID) REFERENCES dbo.Locker(LockerID)
+);
+
+
+-- Illustrative demo assumptions only; replace with verified company/route costs if available.
+-- One-way estimated transfer cost = fixed handling cost + estimated road km * cost per km.
+INSERT INTO dbo.TransportCostSettings
+(SettingID, RoadDistanceFactor, CostPerKmEUR, FixedHandlingCostEUR, AssumptionNotes)
+VALUES
+(1, 1.30, 0.4500, 1.50,
+ N'Illustrative assumptions for the student prototype, not verified Latvijas Pasts costs. Road distance is approximated from straight-line distance using a 1.30 factor.');
+
+INSERT INTO dbo.Region (RegionID, RegionName) VALUES
+(1,N'Riga'),
+(2,N'Pieriga'),
+(3,N'Kurzeme'),
+(4,N'Vidzeme'),
+(5,N'Zemgale'),
+(6,N'Latgale');
+
+INSERT INTO dbo.Locker (LockerID, LockerCode, LockerName, RegionID, Latitude, Longitude) VALUES
+(1,N'RIGA-01',N'Riga Central',1,56.9496,24.1052),
+(2,N'RIGA-02',N'Riga Old Town',1,56.949,24.108),
+(3,N'RIGA-03',N'Riga Purvciems',1,56.957,24.19),
+(4,N'RIGA-04',N'Riga Imanta',1,56.966,24.014),
+(5,N'RIGA-05',N'Riga Teika',1,56.98,24.17),
+(6,N'RIGA-06',N'Riga Ziepniekkalns',1,56.9,24.1),
+(7,N'RIGA-07',N'Riga Agenskalns',1,56.937,24.075),
+(8,N'RIGA-08',N'Riga Mezaparks',1,57.0,24.16),
+(9,N'PIER-01',N'Jurmala Centre',2,56.972,23.799),
+(10,N'PIER-02',N'Ogre Centre',2,56.816,24.604),
+(11,N'PIER-03',N'Salaspils Centre',2,56.86,24.35),
+(12,N'PIER-04',N'Sigulda Centre',2,57.153,24.859),
+(13,N'KURZ-01',N'Liepaja Centre',3,56.505,21.01),
+(14,N'KURZ-02',N'Ventspils Centre',3,57.389,21.56),
+(15,N'KURZ-03',N'Kuldiga Centre',3,56.968,21.968),
+(16,N'KURZ-04',N'Talsi Centre',3,57.245,22.59),
+(17,N'VIDZ-01',N'Valmiera Centre',4,57.538,25.426),
+(18,N'VIDZ-02',N'Cesis Centre',4,57.312,25.274),
+(19,N'VIDZ-03',N'Aluksne Centre',4,57.421,27.046),
+(20,N'ZEMG-01',N'Jelgava Centre',5,56.651,23.721),
+(21,N'LATG-01',N'Daugavpils Centre',6,55.874,26.536),
+(22,N'LATG-02',N'Rezekne Centre',6,56.509,27.333),
+(23,N'LATG-03',N'Jekabpils Centre',6,56.499,25.857),
+(24,N'LATG-04',N'Ludza Centre',6,56.546,27.718),
+(25,N'RIGA-09',N'Riga Mežciems',1,56.967,24.23),
+(26,N'RIGA-10',N'Riga Zolitude',1,56.94,24.015),
+(27,N'PIER-05',N'Baldone Centre',2,56.744,24.4),
+(28,N'ZEMG-02',N'Bauska Centre',5,56.407,24.190),
+(29,N'ZEMG-03',N'Dobele Centre',5,56.624,23.280),
+(30,N'ZEMG-04',N'Tukums Centre',5,56.967,23.155);
+
+INSERT INTO dbo.LockerCompartment (LockerID, CompartmentSize, TotalCompartments) VALUES
+(1,N'Small',30),
+(1,N'Medium',25),
+(1,N'Large',15),
+(2,N'Small',22),
+(2,N'Medium',20),
+(2,N'Large',12),
+(3,N'Small',24),
+(3,N'Medium',22),
+(3,N'Large',12),
+(4,N'Small',20),
+(4,N'Medium',18),
+(4,N'Large',10),
+(5,N'Small',18),
+(5,N'Medium',18),
+(5,N'Large',9),
+(6,N'Small',18),
+(6,N'Medium',16),
+(6,N'Large',8),
+(7,N'Small',20),
+(7,N'Medium',18),
+(7,N'Large',10),
+(8,N'Small',16),
+(8,N'Medium',14),
+(8,N'Large',8),
+(9,N'Small',18),
+(9,N'Medium',16),
+(9,N'Large',8),
+(10,N'Small',18),
+(10,N'Medium',16),
+(10,N'Large',8),
+(11,N'Small',16),
+(11,N'Medium',14),
+(11,N'Large',7),
+(12,N'Small',16),
+(12,N'Medium',14),
+(12,N'Large',7),
+(13,N'Small',20),
+(13,N'Medium',18),
+(13,N'Large',10),
+(14,N'Small',18),
+(14,N'Medium',16),
+(14,N'Large',8),
+(15,N'Small',12),
+(15,N'Medium',12),
+(15,N'Large',6),
+(16,N'Small',12),
+(16,N'Medium',12),
+(16,N'Large',6),
+(17,N'Small',18),
+(17,N'Medium',16),
+(17,N'Large',8),
+(18,N'Small',16),
+(18,N'Medium',14),
+(18,N'Large',7),
+(19,N'Small',12),
+(19,N'Medium',10),
+(19,N'Large',5),
+(20,N'Small',12),
+(20,N'Medium',10),
+(20,N'Large',5),
+(21,N'Small',20),
+(21,N'Medium',18),
+(21,N'Large',10),
+(22,N'Small',16),
+(22,N'Medium',14),
+(22,N'Large',7),
+(23,N'Small',16),
+(23,N'Medium',14),
+(23,N'Large',7),
+(24,N'Small',10),
+(24,N'Medium',9),
+(24,N'Large',5),
+(25,N'Small',18),
+(25,N'Medium',16),
+(25,N'Large',8),
+(26,N'Small',18),
+(26,N'Medium',16),
+(26,N'Large',8),
+(27,N'Small',10),
+(27,N'Medium',9),
+(27,N'Large',5),
+(28,N'Small',12),
+(28,N'Medium',10),
+(28,N'Large',5),
+(29,N'Small',12),
+(29,N'Medium',10),
+(29,N'Large',5),
+(30,N'Small',10),
+(30,N'Medium',9),
+(30,N'Large',5);
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00001',N'Large',CONVERT(datetime2,N'2026-10-28 04:00:00',120),CONVERT(datetime2,N'2026-10-30 04:00:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 21:00:00',120)),
+(N'LP-SIM-00002',N'Small',CONVERT(datetime2,N'2026-10-30 09:25:00',120),CONVERT(datetime2,N'2026-10-31 14:25:00',120),CONVERT(datetime2,N'2026-10-31 14:25:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-31 14:25:00',120)),
+(N'LP-SIM-00003',N'Large',CONVERT(datetime2,N'2026-11-13 17:53:00',120),CONVERT(datetime2,N'2026-11-15 22:53:00',120),CONVERT(datetime2,N'2026-11-15 22:53:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-15 22:53:00',120)),
+(N'LP-SIM-00004',N'Small',CONVERT(datetime2,N'2026-11-14 01:23:00',120),CONVERT(datetime2,N'2026-11-17 10:23:00',120),CONVERT(datetime2,N'2026-11-17 10:23:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-17 10:23:00',120)),
+(N'LP-SIM-00005',N'Medium',CONVERT(datetime2,N'2026-11-12 18:15:00',120),CONVERT(datetime2,N'2026-11-14 06:15:00',120),CONVERT(datetime2,N'2026-11-14 06:15:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-14 06:15:00',120)),
+(N'LP-SIM-00006',N'Large',CONVERT(datetime2,N'2026-10-20 00:52:00',120),CONVERT(datetime2,N'2026-10-23 06:52:00',120),CONVERT(datetime2,N'2026-10-23 06:52:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-23 06:52:00',120)),
+(N'LP-SIM-00007',N'Small',CONVERT(datetime2,N'2026-11-04 19:33:00',120),CONVERT(datetime2,N'2026-11-08 19:33:00',120),CONVERT(datetime2,N'2026-11-08 19:33:00',120),CONVERT(datetime2,N'2026-11-09 17:33:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-09 17:33:00',120)),
+(N'LP-SIM-00008',N'Medium',CONVERT(datetime2,N'2026-10-25 18:18:00',120),CONVERT(datetime2,N'2026-10-28 03:18:00',120),CONVERT(datetime2,N'2026-10-28 03:18:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-28 03:18:00',120)),
+(N'LP-SIM-00009',N'Large',CONVERT(datetime2,N'2026-11-01 20:52:00',120),CONVERT(datetime2,N'2026-11-03 20:52:00',120),CONVERT(datetime2,N'2026-11-03 20:52:00',120),CONVERT(datetime2,N'2026-11-04 04:52:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-04 04:52:00',120)),
+(N'LP-SIM-00010',N'Small',CONVERT(datetime2,N'2026-10-29 21:02:00',120),CONVERT(datetime2,N'2026-10-31 09:02:00',120),CONVERT(datetime2,N'2026-10-31 09:02:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-31 09:02:00',120)),
+(N'LP-SIM-00011',N'Large',CONVERT(datetime2,N'2026-10-21 14:33:00',120),CONVERT(datetime2,N'2026-10-25 02:33:00',120),CONVERT(datetime2,N'2026-10-25 02:33:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-25 02:33:00',120)),
+(N'LP-SIM-00012',N'Medium',CONVERT(datetime2,N'2026-10-15 22:05:00',120),CONVERT(datetime2,N'2026-10-20 10:05:00',120),CONVERT(datetime2,N'2026-10-20 10:05:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-20 10:05:00',120)),
+(N'LP-SIM-00013',N'Medium',CONVERT(datetime2,N'2026-10-24 23:05:00',120),CONVERT(datetime2,N'2026-10-26 06:05:00',120),CONVERT(datetime2,N'2026-10-26 06:05:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-26 06:05:00',120)),
+(N'LP-SIM-00014',N'Medium',CONVERT(datetime2,N'2026-11-09 22:48:00',120),CONVERT(datetime2,N'2026-11-10 22:48:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 14:48:00',120)),
+(N'LP-SIM-00015',N'Medium',CONVERT(datetime2,N'2026-10-18 03:49:00',120),CONVERT(datetime2,N'2026-10-22 03:49:00',120),CONVERT(datetime2,N'2026-10-22 03:49:00',120),CONVERT(datetime2,N'2026-10-22 07:49:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-22 07:49:00',120)),
+(N'LP-SIM-00016',N'Medium',CONVERT(datetime2,N'2026-10-21 20:37:00',120),CONVERT(datetime2,N'2026-10-25 20:37:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-25 12:37:00',120)),
+(N'LP-SIM-00017',N'Medium',CONVERT(datetime2,N'2026-11-04 13:01:00',120),CONVERT(datetime2,N'2026-11-07 13:01:00',120),CONVERT(datetime2,N'2026-11-07 13:01:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-07 13:01:00',120)),
+(N'LP-SIM-00018',N'Medium',CONVERT(datetime2,N'2026-10-30 04:54:00',120),CONVERT(datetime2,N'2026-11-02 04:54:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-02 01:54:00',120)),
+(N'LP-SIM-00019',N'Large',CONVERT(datetime2,N'2026-10-18 18:03:00',120),CONVERT(datetime2,N'2026-10-20 18:03:00',120),CONVERT(datetime2,N'2026-10-20 18:03:00',120),NULL,N'Returned',NULL,4,CONVERT(datetime2,N'2026-10-23 18:03:00',120)),
+(N'LP-SIM-00020',N'Small',CONVERT(datetime2,N'2026-10-18 21:16:00',120),CONVERT(datetime2,N'2026-10-21 21:16:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-21 18:16:00',120)),
+(N'LP-SIM-00021',N'Medium',CONVERT(datetime2,N'2026-10-20 12:22:00',120),CONVERT(datetime2,N'2026-10-22 17:22:00',120),CONVERT(datetime2,N'2026-10-22 17:22:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-22 17:22:00',120)),
+(N'LP-SIM-00022',N'Medium',CONVERT(datetime2,N'2026-11-04 02:26:00',120),CONVERT(datetime2,N'2026-11-05 02:26:00',120),CONVERT(datetime2,N'2026-11-05 02:26:00',120),CONVERT(datetime2,N'2026-11-05 08:26:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-05 08:26:00',120)),
+(N'LP-SIM-00023',N'Medium',CONVERT(datetime2,N'2026-11-08 12:07:00',120),CONVERT(datetime2,N'2026-11-09 12:07:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-09 10:07:00',120)),
+(N'LP-SIM-00024',N'Small',CONVERT(datetime2,N'2026-11-12 18:25:00',120),CONVERT(datetime2,N'2026-11-16 23:25:00',120),CONVERT(datetime2,N'2026-11-16 23:25:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-16 23:25:00',120)),
+(N'LP-SIM-00025',N'Small',CONVERT(datetime2,N'2026-10-20 00:38:00',120),CONVERT(datetime2,N'2026-10-23 03:38:00',120),CONVERT(datetime2,N'2026-10-23 03:38:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-23 03:38:00',120)),
+(N'LP-SIM-00026',N'Small',CONVERT(datetime2,N'2026-10-21 23:01:00',120),CONVERT(datetime2,N'2026-10-24 10:01:00',120),CONVERT(datetime2,N'2026-10-24 10:01:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-24 10:01:00',120)),
+(N'LP-SIM-00027',N'Medium',CONVERT(datetime2,N'2026-10-30 14:10:00',120),CONVERT(datetime2,N'2026-11-03 14:10:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-03 05:10:00',120)),
+(N'LP-SIM-00028',N'Small',CONVERT(datetime2,N'2026-10-22 21:53:00',120),CONVERT(datetime2,N'2026-10-25 07:53:00',120),CONVERT(datetime2,N'2026-10-25 07:53:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-25 07:53:00',120)),
+(N'LP-SIM-00029',N'Small',CONVERT(datetime2,N'2026-11-13 04:50:00',120),CONVERT(datetime2,N'2026-11-14 04:50:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-14 02:50:00',120)),
+(N'LP-SIM-00030',N'Medium',CONVERT(datetime2,N'2026-10-23 05:19:00',120),CONVERT(datetime2,N'2026-10-27 10:19:00',120),CONVERT(datetime2,N'2026-10-27 10:19:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-27 10:19:00',120)),
+(N'LP-SIM-00031',N'Small',CONVERT(datetime2,N'2026-10-19 03:51:00',120),CONVERT(datetime2,N'2026-10-21 06:51:00',120),CONVERT(datetime2,N'2026-10-21 06:51:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-21 06:51:00',120)),
+(N'LP-SIM-00032',N'Large',CONVERT(datetime2,N'2026-11-09 07:34:00',120),CONVERT(datetime2,N'2026-11-10 07:34:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 00:34:00',120)),
+(N'LP-SIM-00033',N'Medium',CONVERT(datetime2,N'2026-10-25 08:53:00',120),CONVERT(datetime2,N'2026-10-26 15:53:00',120),CONVERT(datetime2,N'2026-10-26 15:53:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-26 15:53:00',120)),
+(N'LP-SIM-00034',N'Small',CONVERT(datetime2,N'2026-11-13 21:33:00',120),CONVERT(datetime2,N'2026-11-16 03:33:00',120),CONVERT(datetime2,N'2026-11-16 03:33:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-16 03:33:00',120)),
+(N'LP-SIM-00035',N'Small',CONVERT(datetime2,N'2026-10-29 19:16:00',120),CONVERT(datetime2,N'2026-11-01 07:16:00',120),CONVERT(datetime2,N'2026-11-01 07:16:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-01 07:16:00',120)),
+(N'LP-SIM-00036',N'Small',CONVERT(datetime2,N'2026-11-06 16:17:00',120),CONVERT(datetime2,N'2026-11-08 18:17:00',120),CONVERT(datetime2,N'2026-11-08 18:17:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-08 18:17:00',120)),
+(N'LP-SIM-00037',N'Small',CONVERT(datetime2,N'2026-11-12 15:35:00',120),CONVERT(datetime2,N'2026-11-16 15:35:00',120),CONVERT(datetime2,N'2026-11-16 15:35:00',120),CONVERT(datetime2,N'2026-11-19 06:35:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-19 06:35:00',120)),
+(N'LP-SIM-00038',N'Medium',CONVERT(datetime2,N'2026-10-22 16:30:00',120),CONVERT(datetime2,N'2026-10-27 03:30:00',120),CONVERT(datetime2,N'2026-10-27 03:30:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-27 03:30:00',120)),
+(N'LP-SIM-00039',N'Medium',CONVERT(datetime2,N'2026-11-11 11:26:00',120),CONVERT(datetime2,N'2026-11-15 16:26:00',120),CONVERT(datetime2,N'2026-11-15 16:26:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-15 16:26:00',120)),
+(N'LP-SIM-00040',N'Small',CONVERT(datetime2,N'2026-11-05 17:23:00',120),CONVERT(datetime2,N'2026-11-09 17:23:00',120),CONVERT(datetime2,N'2026-11-09 17:23:00',120),CONVERT(datetime2,N'2026-11-09 20:23:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-09 20:23:00',120)),
+(N'LP-SIM-00041',N'Small',CONVERT(datetime2,N'2026-11-01 16:54:00',120),CONVERT(datetime2,N'2026-11-03 16:54:00',120),CONVERT(datetime2,N'2026-11-03 16:54:00',120),CONVERT(datetime2,N'2026-11-04 02:54:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-04 02:54:00',120)),
+(N'LP-SIM-00042',N'Large',CONVERT(datetime2,N'2026-11-14 04:31:00',120),CONVERT(datetime2,N'2026-11-18 06:31:00',120),CONVERT(datetime2,N'2026-11-18 06:31:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-18 06:31:00',120)),
+(N'LP-SIM-00043',N'Large',CONVERT(datetime2,N'2026-10-26 21:45:00',120),CONVERT(datetime2,N'2026-10-29 07:45:00',120),CONVERT(datetime2,N'2026-10-29 07:45:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-29 07:45:00',120)),
+(N'LP-SIM-00044',N'Medium',CONVERT(datetime2,N'2026-11-02 12:55:00',120),CONVERT(datetime2,N'2026-11-06 21:55:00',120),CONVERT(datetime2,N'2026-11-06 21:55:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-06 21:55:00',120)),
+(N'LP-SIM-00045',N'Small',CONVERT(datetime2,N'2026-10-16 00:59:00',120),CONVERT(datetime2,N'2026-10-18 01:59:00',120),CONVERT(datetime2,N'2026-10-18 01:59:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-18 01:59:00',120)),
+(N'LP-SIM-00046',N'Medium',CONVERT(datetime2,N'2026-10-30 15:29:00',120),CONVERT(datetime2,N'2026-11-01 16:29:00',120),CONVERT(datetime2,N'2026-11-01 16:29:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-01 16:29:00',120)),
+(N'LP-SIM-00047',N'Medium',CONVERT(datetime2,N'2026-11-12 06:09:00',120),CONVERT(datetime2,N'2026-11-13 06:09:00',120),CONVERT(datetime2,N'2026-11-13 06:09:00',120),CONVERT(datetime2,N'2026-11-13 13:09:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-13 13:09:00',120)),
+(N'LP-SIM-00048',N'Small',CONVERT(datetime2,N'2026-10-22 13:20:00',120),CONVERT(datetime2,N'2026-10-25 20:20:00',120),CONVERT(datetime2,N'2026-10-25 20:20:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-25 20:20:00',120)),
+(N'LP-SIM-00049',N'Medium',CONVERT(datetime2,N'2026-10-16 11:04:00',120),CONVERT(datetime2,N'2026-10-18 11:04:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-18 02:04:00',120)),
+(N'LP-SIM-00050',N'Small',CONVERT(datetime2,N'2026-10-30 06:59:00',120),CONVERT(datetime2,N'2026-11-02 06:59:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-02 05:59:00',120)),
+(N'LP-SIM-00051',N'Small',CONVERT(datetime2,N'2026-10-22 14:54:00',120),CONVERT(datetime2,N'2026-10-25 20:54:00',120),CONVERT(datetime2,N'2026-10-25 20:54:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-25 20:54:00',120)),
+(N'LP-SIM-00052',N'Medium',CONVERT(datetime2,N'2026-11-13 08:43:00',120),CONVERT(datetime2,N'2026-11-17 17:43:00',120),CONVERT(datetime2,N'2026-11-17 17:43:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-17 17:43:00',120)),
+(N'LP-SIM-00053',N'Small',CONVERT(datetime2,N'2026-10-20 10:01:00',120),CONVERT(datetime2,N'2026-10-21 10:01:00',120),CONVERT(datetime2,N'2026-10-21 10:01:00',120),NULL,N'Returned',NULL,4,CONVERT(datetime2,N'2026-10-24 10:01:00',120)),
+(N'LP-SIM-00054',N'Medium',CONVERT(datetime2,N'2026-10-23 03:39:00',120),CONVERT(datetime2,N'2026-10-27 03:39:00',120),CONVERT(datetime2,N'2026-10-27 03:39:00',120),CONVERT(datetime2,N'2026-10-29 12:39:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-29 12:39:00',120)),
+(N'LP-SIM-00055',N'Medium',CONVERT(datetime2,N'2026-11-08 05:56:00',120),CONVERT(datetime2,N'2026-11-09 12:56:00',120),CONVERT(datetime2,N'2026-11-09 12:56:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-09 12:56:00',120)),
+(N'LP-SIM-00056',N'Small',CONVERT(datetime2,N'2026-10-27 22:32:00',120),CONVERT(datetime2,N'2026-10-29 22:32:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-29 16:32:00',120)),
+(N'LP-SIM-00057',N'Small',CONVERT(datetime2,N'2026-11-13 15:47:00',120),CONVERT(datetime2,N'2026-11-15 00:47:00',120),CONVERT(datetime2,N'2026-11-15 00:47:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-15 00:47:00',120)),
+(N'LP-SIM-00058',N'Small',CONVERT(datetime2,N'2026-10-24 10:05:00',120),CONVERT(datetime2,N'2026-10-26 13:05:00',120),CONVERT(datetime2,N'2026-10-26 13:05:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-26 13:05:00',120)),
+(N'LP-SIM-00059',N'Small',CONVERT(datetime2,N'2026-11-14 03:38:00',120),CONVERT(datetime2,N'2026-11-17 03:38:00',120),CONVERT(datetime2,N'2026-11-17 03:38:00',120),CONVERT(datetime2,N'2026-11-19 16:38:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-19 16:38:00',120)),
+(N'LP-SIM-00060',N'Medium',CONVERT(datetime2,N'2026-10-24 04:49:00',120),CONVERT(datetime2,N'2026-10-26 09:49:00',120),CONVERT(datetime2,N'2026-10-26 09:49:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-26 09:49:00',120)),
+(N'LP-SIM-00061',N'Large',CONVERT(datetime2,N'2026-11-14 01:31:00',120),CONVERT(datetime2,N'2026-11-16 01:31:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-15 14:31:00',120)),
+(N'LP-SIM-00062',N'Large',CONVERT(datetime2,N'2026-10-20 14:35:00',120),CONVERT(datetime2,N'2026-10-24 14:35:00',120),CONVERT(datetime2,N'2026-10-24 14:35:00',120),CONVERT(datetime2,N'2026-10-26 01:35:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-26 01:35:00',120)),
+(N'LP-SIM-00063',N'Small',CONVERT(datetime2,N'2026-11-08 03:27:00',120),CONVERT(datetime2,N'2026-11-09 05:27:00',120),CONVERT(datetime2,N'2026-11-09 05:27:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-09 05:27:00',120)),
+(N'LP-SIM-00064',N'Small',CONVERT(datetime2,N'2026-11-08 00:48:00',120),CONVERT(datetime2,N'2026-11-12 00:48:00',120),CONVERT(datetime2,N'2026-11-12 00:48:00',120),CONVERT(datetime2,N'2026-11-12 11:48:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-12 11:48:00',120)),
+(N'LP-SIM-00065',N'Small',CONVERT(datetime2,N'2026-10-29 17:05:00',120),CONVERT(datetime2,N'2026-11-01 00:05:00',120),CONVERT(datetime2,N'2026-11-01 00:05:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-11-01 00:05:00',120)),
+(N'LP-SIM-00066',N'Large',CONVERT(datetime2,N'2026-11-12 17:58:00',120),CONVERT(datetime2,N'2026-11-16 17:58:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-16 06:58:00',120)),
+(N'LP-SIM-00067',N'Small',CONVERT(datetime2,N'2026-10-19 10:45:00',120),CONVERT(datetime2,N'2026-10-22 10:45:00',120),CONVERT(datetime2,N'2026-10-22 10:45:00',120),CONVERT(datetime2,N'2026-10-23 15:45:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-23 15:45:00',120)),
+(N'LP-SIM-00068',N'Small',CONVERT(datetime2,N'2026-11-10 09:50:00',120),CONVERT(datetime2,N'2026-11-11 09:50:00',120),CONVERT(datetime2,N'2026-11-11 09:50:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-11 09:50:00',120)),
+(N'LP-SIM-00069',N'Medium',CONVERT(datetime2,N'2026-11-10 13:20:00',120),CONVERT(datetime2,N'2026-11-14 17:20:00',120),CONVERT(datetime2,N'2026-11-14 17:20:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-14 17:20:00',120)),
+(N'LP-SIM-00070',N'Small',CONVERT(datetime2,N'2026-10-27 21:57:00',120),CONVERT(datetime2,N'2026-10-31 07:57:00',120),CONVERT(datetime2,N'2026-10-31 07:57:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-31 07:57:00',120)),
+(N'LP-SIM-00071',N'Small',CONVERT(datetime2,N'2026-11-09 15:16:00',120),CONVERT(datetime2,N'2026-11-10 15:16:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-10 11:16:00',120)),
+(N'LP-SIM-00072',N'Medium',CONVERT(datetime2,N'2026-10-24 00:41:00',120),CONVERT(datetime2,N'2026-10-28 00:41:00',120),CONVERT(datetime2,N'2026-10-28 00:41:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-28 00:41:00',120)),
+(N'LP-SIM-00073',N'Medium',CONVERT(datetime2,N'2026-10-26 13:11:00',120),CONVERT(datetime2,N'2026-10-29 13:11:00',120),CONVERT(datetime2,N'2026-10-29 13:11:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-02 13:11:00',120)),
+(N'LP-SIM-00074',N'Small',CONVERT(datetime2,N'2026-10-27 21:50:00',120),CONVERT(datetime2,N'2026-10-31 21:50:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-31 09:50:00',120)),
+(N'LP-SIM-00075',N'Medium',CONVERT(datetime2,N'2026-11-08 16:21:00',120),CONVERT(datetime2,N'2026-11-09 16:21:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-09 07:21:00',120)),
+(N'LP-SIM-00076',N'Medium',CONVERT(datetime2,N'2026-10-26 17:47:00',120),CONVERT(datetime2,N'2026-10-27 19:47:00',120),CONVERT(datetime2,N'2026-10-27 19:47:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-27 19:47:00',120)),
+(N'LP-SIM-00077',N'Medium',CONVERT(datetime2,N'2026-11-13 03:36:00',120),CONVERT(datetime2,N'2026-11-14 15:36:00',120),CONVERT(datetime2,N'2026-11-14 15:36:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-14 15:36:00',120)),
+(N'LP-SIM-00078',N'Small',CONVERT(datetime2,N'2026-11-08 01:11:00',120),CONVERT(datetime2,N'2026-11-12 07:11:00',120),CONVERT(datetime2,N'2026-11-12 07:11:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-12 07:11:00',120)),
+(N'LP-SIM-00079',N'Medium',CONVERT(datetime2,N'2026-10-29 18:58:00',120),CONVERT(datetime2,N'2026-11-01 21:58:00',120),CONVERT(datetime2,N'2026-11-01 21:58:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-01 21:58:00',120)),
+(N'LP-SIM-00080',N'Large',CONVERT(datetime2,N'2026-11-03 15:10:00',120),CONVERT(datetime2,N'2026-11-07 17:10:00',120),CONVERT(datetime2,N'2026-11-07 17:10:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-07 17:10:00',120)),
+(N'LP-SIM-00081',N'Small',CONVERT(datetime2,N'2026-11-11 21:51:00',120),CONVERT(datetime2,N'2026-11-14 03:51:00',120),CONVERT(datetime2,N'2026-11-14 03:51:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-14 03:51:00',120)),
+(N'LP-SIM-00082',N'Large',CONVERT(datetime2,N'2026-11-03 20:30:00',120),CONVERT(datetime2,N'2026-11-04 20:30:00',120),CONVERT(datetime2,N'2026-11-04 20:30:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-04 20:30:00',120)),
+(N'LP-SIM-00083',N'Small',CONVERT(datetime2,N'2026-10-21 14:41:00',120),CONVERT(datetime2,N'2026-10-24 14:41:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-24 10:41:00',120)),
+(N'LP-SIM-00084',N'Small',CONVERT(datetime2,N'2026-10-24 04:04:00',120),CONVERT(datetime2,N'2026-10-28 12:04:00',120),CONVERT(datetime2,N'2026-10-28 12:04:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-28 12:04:00',120)),
+(N'LP-SIM-00085',N'Medium',CONVERT(datetime2,N'2026-10-17 23:22:00',120),CONVERT(datetime2,N'2026-10-18 23:22:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-18 11:22:00',120)),
+(N'LP-SIM-00086',N'Small',CONVERT(datetime2,N'2026-10-16 15:54:00',120),CONVERT(datetime2,N'2026-10-20 00:54:00',120),CONVERT(datetime2,N'2026-10-20 00:54:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-20 00:54:00',120)),
+(N'LP-SIM-00087',N'Medium',CONVERT(datetime2,N'2026-10-21 15:06:00',120),CONVERT(datetime2,N'2026-10-23 23:06:00',120),CONVERT(datetime2,N'2026-10-23 23:06:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-23 23:06:00',120)),
+(N'LP-SIM-00088',N'Small',CONVERT(datetime2,N'2026-11-09 14:26:00',120),CONVERT(datetime2,N'2026-11-10 14:26:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 03:26:00',120)),
+(N'LP-SIM-00089',N'Small',CONVERT(datetime2,N'2026-11-06 22:49:00',120),CONVERT(datetime2,N'2026-11-11 04:49:00',120),CONVERT(datetime2,N'2026-11-11 04:49:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-11 04:49:00',120)),
+(N'LP-SIM-00090',N'Small',CONVERT(datetime2,N'2026-10-20 16:09:00',120),CONVERT(datetime2,N'2026-10-23 17:09:00',120),CONVERT(datetime2,N'2026-10-23 17:09:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-23 17:09:00',120)),
+(N'LP-SIM-00091',N'Small',CONVERT(datetime2,N'2026-11-04 12:28:00',120),CONVERT(datetime2,N'2026-11-05 23:28:00',120),CONVERT(datetime2,N'2026-11-05 23:28:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-05 23:28:00',120)),
+(N'LP-SIM-00092',N'Large',CONVERT(datetime2,N'2026-10-30 00:19:00',120),CONVERT(datetime2,N'2026-10-31 00:19:00',120),CONVERT(datetime2,N'2026-10-31 00:19:00',120),CONVERT(datetime2,N'2026-11-02 08:19:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-02 08:19:00',120)),
+(N'LP-SIM-00093',N'Small',CONVERT(datetime2,N'2026-10-22 20:53:00',120),CONVERT(datetime2,N'2026-10-26 21:53:00',120),CONVERT(datetime2,N'2026-10-26 21:53:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-26 21:53:00',120)),
+(N'LP-SIM-00094',N'Small',CONVERT(datetime2,N'2026-11-02 11:09:00',120),CONVERT(datetime2,N'2026-11-03 17:09:00',120),CONVERT(datetime2,N'2026-11-03 17:09:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-03 17:09:00',120)),
+(N'LP-SIM-00095',N'Small',CONVERT(datetime2,N'2026-11-03 12:23:00',120),CONVERT(datetime2,N'2026-11-06 12:23:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-06 04:23:00',120)),
+(N'LP-SIM-00096',N'Medium',CONVERT(datetime2,N'2026-11-12 13:38:00',120),CONVERT(datetime2,N'2026-11-15 01:38:00',120),CONVERT(datetime2,N'2026-11-15 01:38:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-15 01:38:00',120)),
+(N'LP-SIM-00097',N'Medium',CONVERT(datetime2,N'2026-11-14 06:32:00',120),CONVERT(datetime2,N'2026-11-18 12:32:00',120),CONVERT(datetime2,N'2026-11-18 12:32:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-18 12:32:00',120)),
+(N'LP-SIM-00098',N'Large',CONVERT(datetime2,N'2026-10-16 06:50:00',120),CONVERT(datetime2,N'2026-10-18 17:50:00',120),CONVERT(datetime2,N'2026-10-18 17:50:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-18 17:50:00',120)),
+(N'LP-SIM-00099',N'Medium',CONVERT(datetime2,N'2026-10-30 05:06:00',120),CONVERT(datetime2,N'2026-11-03 11:06:00',120),CONVERT(datetime2,N'2026-11-03 11:06:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-03 11:06:00',120)),
+(N'LP-SIM-00100',N'Large',CONVERT(datetime2,N'2026-10-18 03:59:00',120),CONVERT(datetime2,N'2026-10-21 13:59:00',120),CONVERT(datetime2,N'2026-10-21 13:59:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-21 13:59:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00101',N'Medium',CONVERT(datetime2,N'2026-10-29 05:49:00',120),CONVERT(datetime2,N'2026-10-30 05:49:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-29 21:49:00',120)),
+(N'LP-SIM-00102',N'Small',CONVERT(datetime2,N'2026-10-28 11:58:00',120),CONVERT(datetime2,N'2026-10-29 22:58:00',120),CONVERT(datetime2,N'2026-10-29 22:58:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-29 22:58:00',120)),
+(N'LP-SIM-00103',N'Medium',CONVERT(datetime2,N'2026-10-31 06:21:00',120),CONVERT(datetime2,N'2026-11-03 06:21:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-02 22:21:00',120)),
+(N'LP-SIM-00104',N'Small',CONVERT(datetime2,N'2026-11-03 13:41:00',120),CONVERT(datetime2,N'2026-11-07 14:41:00',120),CONVERT(datetime2,N'2026-11-07 14:41:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-07 14:41:00',120)),
+(N'LP-SIM-00105',N'Medium',CONVERT(datetime2,N'2026-11-05 21:15:00',120),CONVERT(datetime2,N'2026-11-10 00:15:00',120),CONVERT(datetime2,N'2026-11-10 00:15:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-10 00:15:00',120)),
+(N'LP-SIM-00106',N'Small',CONVERT(datetime2,N'2026-10-23 21:10:00',120),CONVERT(datetime2,N'2026-10-25 05:10:00',120),CONVERT(datetime2,N'2026-10-25 05:10:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-25 05:10:00',120)),
+(N'LP-SIM-00107',N'Small',CONVERT(datetime2,N'2026-10-27 22:52:00',120),CONVERT(datetime2,N'2026-10-31 04:52:00',120),CONVERT(datetime2,N'2026-10-31 04:52:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-31 04:52:00',120)),
+(N'LP-SIM-00108',N'Medium',CONVERT(datetime2,N'2026-11-04 23:42:00',120),CONVERT(datetime2,N'2026-11-06 23:42:00',120),CONVERT(datetime2,N'2026-11-06 23:42:00',120),CONVERT(datetime2,N'2026-11-09 08:42:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-09 08:42:00',120)),
+(N'LP-SIM-00109',N'Medium',CONVERT(datetime2,N'2026-10-20 10:03:00',120),CONVERT(datetime2,N'2026-10-24 20:03:00',120),CONVERT(datetime2,N'2026-10-24 20:03:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-24 20:03:00',120)),
+(N'LP-SIM-00110',N'Large',CONVERT(datetime2,N'2026-11-12 21:43:00',120),CONVERT(datetime2,N'2026-11-16 08:43:00',120),CONVERT(datetime2,N'2026-11-16 08:43:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-16 08:43:00',120)),
+(N'LP-SIM-00111',N'Small',CONVERT(datetime2,N'2026-10-26 22:50:00',120),CONVERT(datetime2,N'2026-10-28 22:50:00',120),CONVERT(datetime2,N'2026-10-28 22:50:00',120),CONVERT(datetime2,N'2026-10-31 04:50:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-31 04:50:00',120)),
+(N'LP-SIM-00112',N'Small',CONVERT(datetime2,N'2026-11-11 11:03:00',120),CONVERT(datetime2,N'2026-11-12 11:03:00',120),CONVERT(datetime2,N'2026-11-12 11:03:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-12 11:03:00',120)),
+(N'LP-SIM-00113',N'Medium',CONVERT(datetime2,N'2026-11-12 21:59:00',120),CONVERT(datetime2,N'2026-11-13 21:59:00',120),CONVERT(datetime2,N'2026-11-13 21:59:00',120),CONVERT(datetime2,N'2026-11-14 11:59:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-14 11:59:00',120)),
+(N'LP-SIM-00114',N'Medium',CONVERT(datetime2,N'2026-10-30 08:48:00',120),CONVERT(datetime2,N'2026-11-02 20:48:00',120),CONVERT(datetime2,N'2026-11-02 20:48:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-02 20:48:00',120)),
+(N'LP-SIM-00115',N'Medium',CONVERT(datetime2,N'2026-10-20 01:34:00',120),CONVERT(datetime2,N'2026-10-24 01:34:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-23 15:34:00',120)),
+(N'LP-SIM-00116',N'Medium',CONVERT(datetime2,N'2026-10-24 16:57:00',120),CONVERT(datetime2,N'2026-10-26 21:57:00',120),CONVERT(datetime2,N'2026-10-26 21:57:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-26 21:57:00',120)),
+(N'LP-SIM-00117',N'Large',CONVERT(datetime2,N'2026-11-10 01:38:00',120),CONVERT(datetime2,N'2026-11-11 01:38:00',120),CONVERT(datetime2,N'2026-11-11 01:38:00',120),CONVERT(datetime2,N'2026-11-11 23:38:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-11 23:38:00',120)),
+(N'LP-SIM-00118',N'Medium',CONVERT(datetime2,N'2026-10-26 03:32:00',120),CONVERT(datetime2,N'2026-10-28 05:32:00',120),CONVERT(datetime2,N'2026-10-28 05:32:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-28 05:32:00',120)),
+(N'LP-SIM-00119',N'Medium',CONVERT(datetime2,N'2026-10-27 01:45:00',120),CONVERT(datetime2,N'2026-10-30 09:45:00',120),CONVERT(datetime2,N'2026-10-30 09:45:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-30 09:45:00',120)),
+(N'LP-SIM-00120',N'Small',CONVERT(datetime2,N'2026-10-16 11:19:00',120),CONVERT(datetime2,N'2026-10-20 21:19:00',120),CONVERT(datetime2,N'2026-10-20 21:19:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-20 21:19:00',120)),
+(N'LP-SIM-00121',N'Small',CONVERT(datetime2,N'2026-11-09 06:50:00',120),CONVERT(datetime2,N'2026-11-13 08:50:00',120),CONVERT(datetime2,N'2026-11-13 08:50:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-13 08:50:00',120)),
+(N'LP-SIM-00122',N'Medium',CONVERT(datetime2,N'2026-10-18 15:45:00',120),CONVERT(datetime2,N'2026-10-20 15:45:00',120),CONVERT(datetime2,N'2026-10-20 15:45:00',120),CONVERT(datetime2,N'2026-10-21 07:45:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-21 07:45:00',120)),
+(N'LP-SIM-00123',N'Large',CONVERT(datetime2,N'2026-11-04 10:50:00',120),CONVERT(datetime2,N'2026-11-08 12:50:00',120),CONVERT(datetime2,N'2026-11-08 12:50:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-08 12:50:00',120)),
+(N'LP-SIM-00124',N'Medium',CONVERT(datetime2,N'2026-11-13 10:37:00',120),CONVERT(datetime2,N'2026-11-14 13:37:00',120),CONVERT(datetime2,N'2026-11-14 13:37:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-14 13:37:00',120)),
+(N'LP-SIM-00125',N'Large',CONVERT(datetime2,N'2026-10-30 15:02:00',120),CONVERT(datetime2,N'2026-11-02 15:02:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-02 08:02:00',120)),
+(N'LP-SIM-00126',N'Medium',CONVERT(datetime2,N'2026-10-29 23:22:00',120),CONVERT(datetime2,N'2026-10-30 23:22:00',120),CONVERT(datetime2,N'2026-10-30 23:22:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-10-30 23:22:00',120)),
+(N'LP-SIM-00127',N'Medium',CONVERT(datetime2,N'2026-10-23 16:51:00',120),CONVERT(datetime2,N'2026-10-24 16:51:00',120),CONVERT(datetime2,N'2026-10-24 16:51:00',120),CONVERT(datetime2,N'2026-10-27 12:51:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-27 12:51:00',120)),
+(N'LP-SIM-00128',N'Medium',CONVERT(datetime2,N'2026-10-29 00:00:00',120),CONVERT(datetime2,N'2026-10-30 03:00:00',120),CONVERT(datetime2,N'2026-10-30 03:00:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-30 03:00:00',120)),
+(N'LP-SIM-00129',N'Medium',CONVERT(datetime2,N'2026-10-16 12:07:00',120),CONVERT(datetime2,N'2026-10-19 12:07:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-19 07:07:00',120)),
+(N'LP-SIM-00130',N'Medium',CONVERT(datetime2,N'2026-11-11 06:06:00',120),CONVERT(datetime2,N'2026-11-14 16:06:00',120),CONVERT(datetime2,N'2026-11-14 16:06:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-14 16:06:00',120)),
+(N'LP-SIM-00131',N'Small',CONVERT(datetime2,N'2026-11-03 11:21:00',120),CONVERT(datetime2,N'2026-11-05 23:21:00',120),CONVERT(datetime2,N'2026-11-05 23:21:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-05 23:21:00',120)),
+(N'LP-SIM-00132',N'Small',CONVERT(datetime2,N'2026-10-30 14:26:00',120),CONVERT(datetime2,N'2026-11-03 15:26:00',120),CONVERT(datetime2,N'2026-11-03 15:26:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-03 15:26:00',120)),
+(N'LP-SIM-00133',N'Large',CONVERT(datetime2,N'2026-10-20 10:29:00',120),CONVERT(datetime2,N'2026-10-24 10:29:00',120),CONVERT(datetime2,N'2026-10-24 10:29:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-24 10:29:00',120)),
+(N'LP-SIM-00134',N'Medium',CONVERT(datetime2,N'2026-10-17 17:28:00',120),CONVERT(datetime2,N'2026-10-21 03:28:00',120),CONVERT(datetime2,N'2026-10-21 03:28:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-21 03:28:00',120)),
+(N'LP-SIM-00135',N'Small',CONVERT(datetime2,N'2026-10-16 20:35:00',120),CONVERT(datetime2,N'2026-10-20 00:35:00',120),CONVERT(datetime2,N'2026-10-20 00:35:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-20 00:35:00',120)),
+(N'LP-SIM-00136',N'Small',CONVERT(datetime2,N'2026-10-22 03:11:00',120),CONVERT(datetime2,N'2026-10-26 03:11:00',120),CONVERT(datetime2,N'2026-10-26 03:11:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-26 03:11:00',120)),
+(N'LP-SIM-00137',N'Medium',CONVERT(datetime2,N'2026-11-03 16:27:00',120),CONVERT(datetime2,N'2026-11-05 16:27:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-05 09:27:00',120)),
+(N'LP-SIM-00138',N'Medium',CONVERT(datetime2,N'2026-11-08 22:19:00',120),CONVERT(datetime2,N'2026-11-11 05:19:00',120),CONVERT(datetime2,N'2026-11-11 05:19:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-11 05:19:00',120)),
+(N'LP-SIM-00139',N'Large',CONVERT(datetime2,N'2026-10-18 20:51:00',120),CONVERT(datetime2,N'2026-10-21 21:51:00',120),CONVERT(datetime2,N'2026-10-21 21:51:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-21 21:51:00',120)),
+(N'LP-SIM-00140',N'Small',CONVERT(datetime2,N'2026-10-16 23:25:00',120),CONVERT(datetime2,N'2026-10-19 23:25:00',120),CONVERT(datetime2,N'2026-10-19 23:25:00',120),CONVERT(datetime2,N'2026-10-22 22:25:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-22 22:25:00',120)),
+(N'LP-SIM-00141',N'Medium',CONVERT(datetime2,N'2026-11-06 07:09:00',120),CONVERT(datetime2,N'2026-11-10 13:09:00',120),CONVERT(datetime2,N'2026-11-10 13:09:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-10 13:09:00',120)),
+(N'LP-SIM-00142',N'Medium',CONVERT(datetime2,N'2026-11-08 14:19:00',120),CONVERT(datetime2,N'2026-11-09 19:19:00',120),CONVERT(datetime2,N'2026-11-09 19:19:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-09 19:19:00',120)),
+(N'LP-SIM-00143',N'Medium',CONVERT(datetime2,N'2026-11-03 21:29:00',120),CONVERT(datetime2,N'2026-11-04 21:29:00',120),CONVERT(datetime2,N'2026-11-04 21:29:00',120),CONVERT(datetime2,N'2026-11-05 16:29:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-05 16:29:00',120)),
+(N'LP-SIM-00144',N'Large',CONVERT(datetime2,N'2026-10-17 17:17:00',120),CONVERT(datetime2,N'2026-10-22 03:17:00',120),CONVERT(datetime2,N'2026-10-22 03:17:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-22 03:17:00',120)),
+(N'LP-SIM-00145',N'Medium',CONVERT(datetime2,N'2026-10-25 22:39:00',120),CONVERT(datetime2,N'2026-10-27 00:39:00',120),CONVERT(datetime2,N'2026-10-27 00:39:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-27 00:39:00',120)),
+(N'LP-SIM-00146',N'Large',CONVERT(datetime2,N'2026-11-04 07:53:00',120),CONVERT(datetime2,N'2026-11-07 15:53:00',120),CONVERT(datetime2,N'2026-11-07 15:53:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-07 15:53:00',120)),
+(N'LP-SIM-00147',N'Small',CONVERT(datetime2,N'2026-10-31 11:38:00',120),CONVERT(datetime2,N'2026-11-01 11:38:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-01 04:38:00',120)),
+(N'LP-SIM-00148',N'Medium',CONVERT(datetime2,N'2026-10-30 18:47:00',120),CONVERT(datetime2,N'2026-10-31 18:47:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-31 07:47:00',120)),
+(N'LP-SIM-00149',N'Medium',CONVERT(datetime2,N'2026-11-06 03:21:00',120),CONVERT(datetime2,N'2026-11-10 12:21:00',120),CONVERT(datetime2,N'2026-11-10 12:21:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-10 12:21:00',120)),
+(N'LP-SIM-00150',N'Medium',CONVERT(datetime2,N'2026-10-28 20:50:00',120),CONVERT(datetime2,N'2026-10-29 20:50:00',120),CONVERT(datetime2,N'2026-10-29 20:50:00',120),CONVERT(datetime2,N'2026-10-30 14:50:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-30 14:50:00',120)),
+(N'LP-SIM-00151',N'Small',CONVERT(datetime2,N'2026-10-20 23:06:00',120),CONVERT(datetime2,N'2026-10-23 06:06:00',120),CONVERT(datetime2,N'2026-10-23 06:06:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-23 06:06:00',120)),
+(N'LP-SIM-00152',N'Small',CONVERT(datetime2,N'2026-11-07 16:42:00',120),CONVERT(datetime2,N'2026-11-08 20:42:00',120),CONVERT(datetime2,N'2026-11-08 20:42:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-08 20:42:00',120)),
+(N'LP-SIM-00153',N'Large',CONVERT(datetime2,N'2026-11-08 12:52:00',120),CONVERT(datetime2,N'2026-11-11 13:52:00',120),CONVERT(datetime2,N'2026-11-11 13:52:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-11 13:52:00',120)),
+(N'LP-SIM-00154',N'Small',CONVERT(datetime2,N'2026-10-26 03:01:00',120),CONVERT(datetime2,N'2026-10-28 03:01:00',120),CONVERT(datetime2,N'2026-10-28 03:01:00',120),CONVERT(datetime2,N'2026-10-30 19:01:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-30 19:01:00',120)),
+(N'LP-SIM-00155',N'Small',CONVERT(datetime2,N'2026-10-20 14:23:00',120),CONVERT(datetime2,N'2026-10-22 17:23:00',120),CONVERT(datetime2,N'2026-10-22 17:23:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-22 17:23:00',120)),
+(N'LP-SIM-00156',N'Small',CONVERT(datetime2,N'2026-10-21 21:20:00',120),CONVERT(datetime2,N'2026-10-23 21:20:00',120),CONVERT(datetime2,N'2026-10-23 21:20:00',120),CONVERT(datetime2,N'2026-10-24 01:20:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-24 01:20:00',120)),
+(N'LP-SIM-00157',N'Medium',CONVERT(datetime2,N'2026-11-07 06:53:00',120),CONVERT(datetime2,N'2026-11-09 07:53:00',120),CONVERT(datetime2,N'2026-11-09 07:53:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-09 07:53:00',120)),
+(N'LP-SIM-00158',N'Large',CONVERT(datetime2,N'2026-11-12 09:52:00',120),CONVERT(datetime2,N'2026-11-16 17:52:00',120),CONVERT(datetime2,N'2026-11-16 17:52:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-16 17:52:00',120)),
+(N'LP-SIM-00159',N'Medium',CONVERT(datetime2,N'2026-10-24 03:13:00',120),CONVERT(datetime2,N'2026-10-28 12:13:00',120),CONVERT(datetime2,N'2026-10-28 12:13:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-28 12:13:00',120)),
+(N'LP-SIM-00160',N'Small',CONVERT(datetime2,N'2026-10-31 01:00:00',120),CONVERT(datetime2,N'2026-11-03 10:00:00',120),CONVERT(datetime2,N'2026-11-03 10:00:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-03 10:00:00',120)),
+(N'LP-SIM-00161',N'Small',CONVERT(datetime2,N'2026-10-31 13:35:00',120),CONVERT(datetime2,N'2026-11-04 13:35:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-04 04:35:00',120)),
+(N'LP-SIM-00162',N'Small',CONVERT(datetime2,N'2026-11-08 16:55:00',120),CONVERT(datetime2,N'2026-11-12 16:55:00',120),CONVERT(datetime2,N'2026-11-12 16:55:00',120),CONVERT(datetime2,N'2026-11-13 14:55:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-13 14:55:00',120)),
+(N'LP-SIM-00163',N'Medium',CONVERT(datetime2,N'2026-10-16 11:23:00',120),CONVERT(datetime2,N'2026-10-19 17:23:00',120),CONVERT(datetime2,N'2026-10-19 17:23:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-10-19 17:23:00',120)),
+(N'LP-SIM-00164',N'Small',CONVERT(datetime2,N'2026-10-28 22:05:00',120),CONVERT(datetime2,N'2026-11-01 22:05:00',120),CONVERT(datetime2,N'2026-11-01 22:05:00',120),CONVERT(datetime2,N'2026-11-02 13:05:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-02 13:05:00',120)),
+(N'LP-SIM-00165',N'Medium',CONVERT(datetime2,N'2026-10-26 04:24:00',120),CONVERT(datetime2,N'2026-10-28 12:24:00',120),CONVERT(datetime2,N'2026-10-28 12:24:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-28 12:24:00',120)),
+(N'LP-SIM-00166',N'Small',CONVERT(datetime2,N'2026-10-21 04:13:00',120),CONVERT(datetime2,N'2026-10-23 09:13:00',120),CONVERT(datetime2,N'2026-10-23 09:13:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-23 09:13:00',120)),
+(N'LP-SIM-00167',N'Medium',CONVERT(datetime2,N'2026-10-27 02:17:00',120),CONVERT(datetime2,N'2026-10-30 09:17:00',120),CONVERT(datetime2,N'2026-10-30 09:17:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-30 09:17:00',120)),
+(N'LP-SIM-00168',N'Small',CONVERT(datetime2,N'2026-10-28 07:59:00',120),CONVERT(datetime2,N'2026-10-31 19:59:00',120),CONVERT(datetime2,N'2026-10-31 19:59:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-31 19:59:00',120)),
+(N'LP-SIM-00169',N'Medium',CONVERT(datetime2,N'2026-10-22 21:38:00',120),CONVERT(datetime2,N'2026-10-23 21:38:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-23 15:38:00',120)),
+(N'LP-SIM-00170',N'Small',CONVERT(datetime2,N'2026-10-28 23:35:00',120),CONVERT(datetime2,N'2026-10-31 09:35:00',120),CONVERT(datetime2,N'2026-10-31 09:35:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-31 09:35:00',120)),
+(N'LP-SIM-00171',N'Large',CONVERT(datetime2,N'2026-11-04 12:03:00',120),CONVERT(datetime2,N'2026-11-05 23:03:00',120),CONVERT(datetime2,N'2026-11-05 23:03:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-05 23:03:00',120)),
+(N'LP-SIM-00172',N'Medium',CONVERT(datetime2,N'2026-10-26 11:43:00',120),CONVERT(datetime2,N'2026-10-30 11:43:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-30 08:43:00',120)),
+(N'LP-SIM-00173',N'Medium',CONVERT(datetime2,N'2026-11-12 17:52:00',120),CONVERT(datetime2,N'2026-11-16 17:52:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-16 13:52:00',120)),
+(N'LP-SIM-00174',N'Large',CONVERT(datetime2,N'2026-10-23 16:49:00',120),CONVERT(datetime2,N'2026-10-27 16:49:00',120),CONVERT(datetime2,N'2026-10-27 16:49:00',120),CONVERT(datetime2,N'2026-10-28 12:49:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-28 12:49:00',120)),
+(N'LP-SIM-00175',N'Large',CONVERT(datetime2,N'2026-11-01 19:49:00',120),CONVERT(datetime2,N'2026-11-03 19:49:00',120),CONVERT(datetime2,N'2026-11-03 19:49:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-03 19:49:00',120)),
+(N'LP-SIM-00176',N'Small',CONVERT(datetime2,N'2026-11-08 16:25:00',120),CONVERT(datetime2,N'2026-11-11 17:25:00',120),CONVERT(datetime2,N'2026-11-11 17:25:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-11 17:25:00',120)),
+(N'LP-SIM-00177',N'Small',CONVERT(datetime2,N'2026-10-22 17:43:00',120),CONVERT(datetime2,N'2026-10-26 00:43:00',120),CONVERT(datetime2,N'2026-10-26 00:43:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-26 00:43:00',120)),
+(N'LP-SIM-00178',N'Medium',CONVERT(datetime2,N'2026-11-11 04:37:00',120),CONVERT(datetime2,N'2026-11-12 08:37:00',120),CONVERT(datetime2,N'2026-11-12 08:37:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-12 08:37:00',120)),
+(N'LP-SIM-00179',N'Medium',CONVERT(datetime2,N'2026-11-07 15:14:00',120),CONVERT(datetime2,N'2026-11-10 15:14:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-10 08:14:00',120)),
+(N'LP-SIM-00180',N'Small',CONVERT(datetime2,N'2026-11-11 12:18:00',120),CONVERT(datetime2,N'2026-11-12 12:18:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-12 11:18:00',120)),
+(N'LP-SIM-00181',N'Medium',CONVERT(datetime2,N'2026-11-13 03:03:00',120),CONVERT(datetime2,N'2026-11-17 13:03:00',120),CONVERT(datetime2,N'2026-11-17 13:03:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-17 13:03:00',120)),
+(N'LP-SIM-00182',N'Small',CONVERT(datetime2,N'2026-10-23 08:58:00',120),CONVERT(datetime2,N'2026-10-24 13:58:00',120),CONVERT(datetime2,N'2026-10-24 13:58:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-24 13:58:00',120)),
+(N'LP-SIM-00183',N'Large',CONVERT(datetime2,N'2026-11-09 04:29:00',120),CONVERT(datetime2,N'2026-11-10 04:29:00',120),CONVERT(datetime2,N'2026-11-10 04:29:00',120),CONVERT(datetime2,N'2026-11-11 16:29:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-11 16:29:00',120)),
+(N'LP-SIM-00184',N'Medium',CONVERT(datetime2,N'2026-10-30 01:25:00',120),CONVERT(datetime2,N'2026-11-02 01:25:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-01 13:25:00',120)),
+(N'LP-SIM-00185',N'Medium',CONVERT(datetime2,N'2026-10-31 04:40:00',120),CONVERT(datetime2,N'2026-11-02 12:40:00',120),CONVERT(datetime2,N'2026-11-02 12:40:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-11-02 12:40:00',120)),
+(N'LP-SIM-00186',N'Large',CONVERT(datetime2,N'2026-10-15 07:52:00',120),CONVERT(datetime2,N'2026-10-18 11:52:00',120),CONVERT(datetime2,N'2026-10-18 11:52:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-18 11:52:00',120)),
+(N'LP-SIM-00187',N'Medium',CONVERT(datetime2,N'2026-11-08 00:48:00',120),CONVERT(datetime2,N'2026-11-10 00:48:00',120),CONVERT(datetime2,N'2026-11-10 00:48:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-10 00:48:00',120)),
+(N'LP-SIM-00188',N'Large',CONVERT(datetime2,N'2026-11-10 20:43:00',120),CONVERT(datetime2,N'2026-11-12 20:43:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-12 18:43:00',120)),
+(N'LP-SIM-00189',N'Small',CONVERT(datetime2,N'2026-10-20 23:10:00',120),CONVERT(datetime2,N'2026-10-25 06:10:00',120),CONVERT(datetime2,N'2026-10-25 06:10:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-25 06:10:00',120)),
+(N'LP-SIM-00190',N'Small',CONVERT(datetime2,N'2026-10-26 11:26:00',120),CONVERT(datetime2,N'2026-10-29 18:26:00',120),CONVERT(datetime2,N'2026-10-29 18:26:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-29 18:26:00',120)),
+(N'LP-SIM-00191',N'Medium',CONVERT(datetime2,N'2026-11-09 06:09:00',120),CONVERT(datetime2,N'2026-11-13 15:09:00',120),CONVERT(datetime2,N'2026-11-13 15:09:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-13 15:09:00',120)),
+(N'LP-SIM-00192',N'Small',CONVERT(datetime2,N'2026-11-02 16:45:00',120),CONVERT(datetime2,N'2026-11-05 02:45:00',120),CONVERT(datetime2,N'2026-11-05 02:45:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-05 02:45:00',120)),
+(N'LP-SIM-00193',N'Medium',CONVERT(datetime2,N'2026-11-08 10:44:00',120),CONVERT(datetime2,N'2026-11-12 22:44:00',120),CONVERT(datetime2,N'2026-11-12 22:44:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-12 22:44:00',120)),
+(N'LP-SIM-00194',N'Medium',CONVERT(datetime2,N'2026-10-28 08:57:00',120),CONVERT(datetime2,N'2026-10-31 10:57:00',120),CONVERT(datetime2,N'2026-10-31 10:57:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-31 10:57:00',120)),
+(N'LP-SIM-00195',N'Small',CONVERT(datetime2,N'2026-11-09 19:52:00',120),CONVERT(datetime2,N'2026-11-13 19:52:00',120),CONVERT(datetime2,N'2026-11-13 19:52:00',120),CONVERT(datetime2,N'2026-11-14 09:52:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-14 09:52:00',120)),
+(N'LP-SIM-00196',N'Medium',CONVERT(datetime2,N'2026-10-26 15:19:00',120),CONVERT(datetime2,N'2026-10-30 20:19:00',120),CONVERT(datetime2,N'2026-10-30 20:19:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-30 20:19:00',120)),
+(N'LP-SIM-00197',N'Small',CONVERT(datetime2,N'2026-11-12 05:15:00',120),CONVERT(datetime2,N'2026-11-16 16:15:00',120),CONVERT(datetime2,N'2026-11-16 16:15:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-16 16:15:00',120)),
+(N'LP-SIM-00198',N'Large',CONVERT(datetime2,N'2026-11-07 11:17:00',120),CONVERT(datetime2,N'2026-11-08 14:17:00',120),CONVERT(datetime2,N'2026-11-08 14:17:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-08 14:17:00',120)),
+(N'LP-SIM-00199',N'Large',CONVERT(datetime2,N'2026-10-25 11:07:00',120),CONVERT(datetime2,N'2026-10-28 11:07:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-28 02:07:00',120)),
+(N'LP-SIM-00200',N'Small',CONVERT(datetime2,N'2026-11-09 16:48:00',120),CONVERT(datetime2,N'2026-11-13 16:48:00',120),CONVERT(datetime2,N'2026-11-13 16:48:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-13 16:48:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00201',N'Small',CONVERT(datetime2,N'2026-10-24 20:12:00',120),CONVERT(datetime2,N'2026-10-26 20:12:00',120),CONVERT(datetime2,N'2026-10-26 20:12:00',120),CONVERT(datetime2,N'2026-10-28 14:12:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-28 14:12:00',120)),
+(N'LP-SIM-00202',N'Small',CONVERT(datetime2,N'2026-10-20 19:48:00',120),CONVERT(datetime2,N'2026-10-21 19:48:00',120),CONVERT(datetime2,N'2026-10-21 19:48:00',120),CONVERT(datetime2,N'2026-10-22 20:48:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-22 20:48:00',120)),
+(N'LP-SIM-00203',N'Small',CONVERT(datetime2,N'2026-10-23 03:06:00',120),CONVERT(datetime2,N'2026-10-24 04:06:00',120),CONVERT(datetime2,N'2026-10-24 04:06:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-24 04:06:00',120)),
+(N'LP-SIM-00204',N'Medium',CONVERT(datetime2,N'2026-10-21 10:04:00',120),CONVERT(datetime2,N'2026-10-22 18:04:00',120),CONVERT(datetime2,N'2026-10-22 18:04:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-22 18:04:00',120)),
+(N'LP-SIM-00205',N'Small',CONVERT(datetime2,N'2026-10-15 21:49:00',120),CONVERT(datetime2,N'2026-10-16 21:49:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-16 12:49:00',120)),
+(N'LP-SIM-00206',N'Medium',CONVERT(datetime2,N'2026-10-18 06:13:00',120),CONVERT(datetime2,N'2026-10-22 11:13:00',120),CONVERT(datetime2,N'2026-10-22 11:13:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-22 11:13:00',120)),
+(N'LP-SIM-00207',N'Medium',CONVERT(datetime2,N'2026-11-05 19:23:00',120),CONVERT(datetime2,N'2026-11-08 21:23:00',120),CONVERT(datetime2,N'2026-11-08 21:23:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-08 21:23:00',120)),
+(N'LP-SIM-00208',N'Small',CONVERT(datetime2,N'2026-10-16 05:44:00',120),CONVERT(datetime2,N'2026-10-17 16:44:00',120),CONVERT(datetime2,N'2026-10-17 16:44:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-17 16:44:00',120)),
+(N'LP-SIM-00209',N'Medium',CONVERT(datetime2,N'2026-10-20 07:43:00',120),CONVERT(datetime2,N'2026-10-21 13:43:00',120),CONVERT(datetime2,N'2026-10-21 13:43:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-21 13:43:00',120)),
+(N'LP-SIM-00210',N'Medium',CONVERT(datetime2,N'2026-10-16 11:21:00',120),CONVERT(datetime2,N'2026-10-19 11:21:00',120),CONVERT(datetime2,N'2026-10-19 11:21:00',120),CONVERT(datetime2,N'2026-10-22 05:21:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-22 05:21:00',120)),
+(N'LP-SIM-00211',N'Small',CONVERT(datetime2,N'2026-10-18 22:57:00',120),CONVERT(datetime2,N'2026-10-23 06:57:00',120),CONVERT(datetime2,N'2026-10-23 06:57:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-23 06:57:00',120)),
+(N'LP-SIM-00212',N'Large',CONVERT(datetime2,N'2026-11-08 03:31:00',120),CONVERT(datetime2,N'2026-11-09 13:31:00',120),CONVERT(datetime2,N'2026-11-09 13:31:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-09 13:31:00',120)),
+(N'LP-SIM-00213',N'Medium',CONVERT(datetime2,N'2026-10-23 12:25:00',120),CONVERT(datetime2,N'2026-10-27 16:25:00',120),CONVERT(datetime2,N'2026-10-27 16:25:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-27 16:25:00',120)),
+(N'LP-SIM-00214',N'Large',CONVERT(datetime2,N'2026-11-03 04:41:00',120),CONVERT(datetime2,N'2026-11-07 05:41:00',120),CONVERT(datetime2,N'2026-11-07 05:41:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-07 05:41:00',120)),
+(N'LP-SIM-00215',N'Medium',CONVERT(datetime2,N'2026-11-02 04:24:00',120),CONVERT(datetime2,N'2026-11-04 06:24:00',120),CONVERT(datetime2,N'2026-11-04 06:24:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-04 06:24:00',120)),
+(N'LP-SIM-00216',N'Small',CONVERT(datetime2,N'2026-10-20 06:03:00',120),CONVERT(datetime2,N'2026-10-23 07:03:00',120),CONVERT(datetime2,N'2026-10-23 07:03:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-23 07:03:00',120)),
+(N'LP-SIM-00217',N'Small',CONVERT(datetime2,N'2026-10-17 08:47:00',120),CONVERT(datetime2,N'2026-10-18 15:47:00',120),CONVERT(datetime2,N'2026-10-18 15:47:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-18 15:47:00',120)),
+(N'LP-SIM-00218',N'Small',CONVERT(datetime2,N'2026-11-12 18:07:00',120),CONVERT(datetime2,N'2026-11-14 18:07:00',120),CONVERT(datetime2,N'2026-11-14 18:07:00',120),CONVERT(datetime2,N'2026-11-17 02:07:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-17 02:07:00',120)),
+(N'LP-SIM-00219',N'Large',CONVERT(datetime2,N'2026-11-10 08:33:00',120),CONVERT(datetime2,N'2026-11-12 12:33:00',120),CONVERT(datetime2,N'2026-11-12 12:33:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-12 12:33:00',120)),
+(N'LP-SIM-00220',N'Medium',CONVERT(datetime2,N'2026-11-01 07:52:00',120),CONVERT(datetime2,N'2026-11-02 07:52:00',120),CONVERT(datetime2,N'2026-11-02 07:52:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-09 07:52:00',120)),
+(N'LP-SIM-00221',N'Medium',CONVERT(datetime2,N'2026-10-23 11:59:00',120),CONVERT(datetime2,N'2026-10-26 23:59:00',120),CONVERT(datetime2,N'2026-10-26 23:59:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-10-26 23:59:00',120)),
+(N'LP-SIM-00222',N'Small',CONVERT(datetime2,N'2026-11-10 19:36:00',120),CONVERT(datetime2,N'2026-11-15 06:36:00',120),CONVERT(datetime2,N'2026-11-15 06:36:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-15 06:36:00',120)),
+(N'LP-SIM-00223',N'Medium',CONVERT(datetime2,N'2026-11-08 14:39:00',120),CONVERT(datetime2,N'2026-11-09 14:39:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-09 09:39:00',120)),
+(N'LP-SIM-00224',N'Medium',CONVERT(datetime2,N'2026-10-26 00:27:00',120),CONVERT(datetime2,N'2026-10-29 09:27:00',120),CONVERT(datetime2,N'2026-10-29 09:27:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-29 09:27:00',120)),
+(N'LP-SIM-00225',N'Large',CONVERT(datetime2,N'2026-10-28 09:40:00',120),CONVERT(datetime2,N'2026-10-29 20:40:00',120),CONVERT(datetime2,N'2026-10-29 20:40:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-29 20:40:00',120)),
+(N'LP-SIM-00226',N'Small',CONVERT(datetime2,N'2026-11-06 21:50:00',120),CONVERT(datetime2,N'2026-11-11 02:50:00',120),CONVERT(datetime2,N'2026-11-11 02:50:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-11 02:50:00',120)),
+(N'LP-SIM-00227',N'Large',CONVERT(datetime2,N'2026-11-13 04:32:00',120),CONVERT(datetime2,N'2026-11-14 13:32:00',120),CONVERT(datetime2,N'2026-11-14 13:32:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-14 13:32:00',120)),
+(N'LP-SIM-00228',N'Small',CONVERT(datetime2,N'2026-10-24 15:23:00',120),CONVERT(datetime2,N'2026-10-26 19:23:00',120),CONVERT(datetime2,N'2026-10-26 19:23:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-10-26 19:23:00',120)),
+(N'LP-SIM-00229',N'Small',CONVERT(datetime2,N'2026-10-30 21:04:00',120),CONVERT(datetime2,N'2026-11-04 01:04:00',120),CONVERT(datetime2,N'2026-11-04 01:04:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-04 01:04:00',120)),
+(N'LP-SIM-00230',N'Small',CONVERT(datetime2,N'2026-10-25 18:18:00',120),CONVERT(datetime2,N'2026-10-30 03:18:00',120),CONVERT(datetime2,N'2026-10-30 03:18:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-30 03:18:00',120)),
+(N'LP-SIM-00231',N'Medium',CONVERT(datetime2,N'2026-10-20 11:09:00',120),CONVERT(datetime2,N'2026-10-23 15:09:00',120),CONVERT(datetime2,N'2026-10-23 15:09:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-23 15:09:00',120)),
+(N'LP-SIM-00232',N'Medium',CONVERT(datetime2,N'2026-10-31 17:03:00',120),CONVERT(datetime2,N'2026-11-02 04:03:00',120),CONVERT(datetime2,N'2026-11-02 04:03:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-02 04:03:00',120)),
+(N'LP-SIM-00233',N'Small',CONVERT(datetime2,N'2026-11-13 18:45:00',120),CONVERT(datetime2,N'2026-11-17 21:45:00',120),CONVERT(datetime2,N'2026-11-17 21:45:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-17 21:45:00',120)),
+(N'LP-SIM-00234',N'Large',CONVERT(datetime2,N'2026-10-29 17:10:00',120),CONVERT(datetime2,N'2026-10-31 00:10:00',120),CONVERT(datetime2,N'2026-10-31 00:10:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-31 00:10:00',120)),
+(N'LP-SIM-00235',N'Small',CONVERT(datetime2,N'2026-11-01 09:31:00',120),CONVERT(datetime2,N'2026-11-03 09:31:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-03 01:31:00',120)),
+(N'LP-SIM-00236',N'Small',CONVERT(datetime2,N'2026-11-04 05:20:00',120),CONVERT(datetime2,N'2026-11-07 09:20:00',120),CONVERT(datetime2,N'2026-11-07 09:20:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-07 09:20:00',120)),
+(N'LP-SIM-00237',N'Small',CONVERT(datetime2,N'2026-10-24 22:50:00',120),CONVERT(datetime2,N'2026-10-28 09:50:00',120),CONVERT(datetime2,N'2026-10-28 09:50:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-28 09:50:00',120)),
+(N'LP-SIM-00238',N'Medium',CONVERT(datetime2,N'2026-11-04 14:49:00',120),CONVERT(datetime2,N'2026-11-06 18:49:00',120),CONVERT(datetime2,N'2026-11-06 18:49:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-06 18:49:00',120)),
+(N'LP-SIM-00239',N'Large',CONVERT(datetime2,N'2026-11-06 13:39:00',120),CONVERT(datetime2,N'2026-11-10 14:39:00',120),CONVERT(datetime2,N'2026-11-10 14:39:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-10 14:39:00',120)),
+(N'LP-SIM-00240',N'Large',CONVERT(datetime2,N'2026-11-11 16:42:00',120),CONVERT(datetime2,N'2026-11-15 16:42:00',120),CONVERT(datetime2,N'2026-11-15 16:42:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-21 16:42:00',120)),
+(N'LP-SIM-00241',N'Small',CONVERT(datetime2,N'2026-11-10 07:33:00',120),CONVERT(datetime2,N'2026-11-12 14:33:00',120),CONVERT(datetime2,N'2026-11-12 14:33:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-12 14:33:00',120)),
+(N'LP-SIM-00242',N'Large',CONVERT(datetime2,N'2026-11-10 04:03:00',120),CONVERT(datetime2,N'2026-11-13 15:03:00',120),CONVERT(datetime2,N'2026-11-13 15:03:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-11-13 15:03:00',120)),
+(N'LP-SIM-00243',N'Small',CONVERT(datetime2,N'2026-10-29 01:23:00',120),CONVERT(datetime2,N'2026-11-01 01:23:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-01 00:23:00',120)),
+(N'LP-SIM-00244',N'Medium',CONVERT(datetime2,N'2026-10-26 15:46:00',120),CONVERT(datetime2,N'2026-10-30 15:46:00',120),CONVERT(datetime2,N'2026-10-30 15:46:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-11-01 15:46:00',120)),
+(N'LP-SIM-00245',N'Medium',CONVERT(datetime2,N'2026-11-01 12:55:00',120),CONVERT(datetime2,N'2026-11-04 21:55:00',120),CONVERT(datetime2,N'2026-11-04 21:55:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-04 21:55:00',120)),
+(N'LP-SIM-00246',N'Small',CONVERT(datetime2,N'2026-10-26 14:25:00',120),CONVERT(datetime2,N'2026-10-28 14:25:00',120),CONVERT(datetime2,N'2026-10-28 14:25:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-10-31 14:25:00',120)),
+(N'LP-SIM-00247',N'Medium',CONVERT(datetime2,N'2026-11-14 04:53:00',120),CONVERT(datetime2,N'2026-11-15 04:53:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-14 20:53:00',120)),
+(N'LP-SIM-00248',N'Medium',CONVERT(datetime2,N'2026-10-27 21:59:00',120),CONVERT(datetime2,N'2026-10-30 05:59:00',120),CONVERT(datetime2,N'2026-10-30 05:59:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-30 05:59:00',120)),
+(N'LP-SIM-00249',N'Small',CONVERT(datetime2,N'2026-10-17 19:59:00',120),CONVERT(datetime2,N'2026-10-19 19:59:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-19 18:59:00',120)),
+(N'LP-SIM-00250',N'Medium',CONVERT(datetime2,N'2026-10-16 12:27:00',120),CONVERT(datetime2,N'2026-10-19 12:27:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-19 05:27:00',120)),
+(N'LP-SIM-00251',N'Small',CONVERT(datetime2,N'2026-10-15 08:11:00',120),CONVERT(datetime2,N'2026-10-19 17:11:00',120),CONVERT(datetime2,N'2026-10-19 17:11:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-19 17:11:00',120)),
+(N'LP-SIM-00252',N'Medium',CONVERT(datetime2,N'2026-10-18 22:23:00',120),CONVERT(datetime2,N'2026-10-20 09:23:00',120),CONVERT(datetime2,N'2026-10-20 09:23:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-20 09:23:00',120)),
+(N'LP-SIM-00253',N'Small',CONVERT(datetime2,N'2026-10-17 09:29:00',120),CONVERT(datetime2,N'2026-10-18 14:29:00',120),CONVERT(datetime2,N'2026-10-18 14:29:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-18 14:29:00',120)),
+(N'LP-SIM-00254',N'Small',CONVERT(datetime2,N'2026-10-21 15:38:00',120),CONVERT(datetime2,N'2026-10-25 00:38:00',120),CONVERT(datetime2,N'2026-10-25 00:38:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-25 00:38:00',120)),
+(N'LP-SIM-00255',N'Small',CONVERT(datetime2,N'2026-11-08 19:50:00',120),CONVERT(datetime2,N'2026-11-12 19:50:00',120),CONVERT(datetime2,N'2026-11-12 19:50:00',120),CONVERT(datetime2,N'2026-11-15 10:50:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-15 10:50:00',120)),
+(N'LP-SIM-00256',N'Small',CONVERT(datetime2,N'2026-11-07 22:17:00',120),CONVERT(datetime2,N'2026-11-11 22:17:00',120),CONVERT(datetime2,N'2026-11-11 22:17:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-14 22:17:00',120)),
+(N'LP-SIM-00257',N'Small',CONVERT(datetime2,N'2026-11-04 06:20:00',120),CONVERT(datetime2,N'2026-11-08 07:20:00',120),CONVERT(datetime2,N'2026-11-08 07:20:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-08 07:20:00',120)),
+(N'LP-SIM-00258',N'Large',CONVERT(datetime2,N'2026-11-02 06:49:00',120),CONVERT(datetime2,N'2026-11-05 06:49:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-04 19:49:00',120)),
+(N'LP-SIM-00259',N'Small',CONVERT(datetime2,N'2026-10-19 21:04:00',120),CONVERT(datetime2,N'2026-10-23 21:04:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-23 09:04:00',120)),
+(N'LP-SIM-00260',N'Medium',CONVERT(datetime2,N'2026-11-12 21:20:00',120),CONVERT(datetime2,N'2026-11-14 21:20:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-14 20:20:00',120)),
+(N'LP-SIM-00261',N'Medium',CONVERT(datetime2,N'2026-11-13 01:21:00',120),CONVERT(datetime2,N'2026-11-15 01:21:00',120),CONVERT(datetime2,N'2026-11-15 01:21:00',120),CONVERT(datetime2,N'2026-11-16 03:21:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-16 03:21:00',120)),
+(N'LP-SIM-00262',N'Small',CONVERT(datetime2,N'2026-10-25 18:00:00',120),CONVERT(datetime2,N'2026-10-29 19:00:00',120),CONVERT(datetime2,N'2026-10-29 19:00:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-29 19:00:00',120)),
+(N'LP-SIM-00263',N'Medium',CONVERT(datetime2,N'2026-10-31 14:43:00',120),CONVERT(datetime2,N'2026-11-02 14:43:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-02 09:43:00',120)),
+(N'LP-SIM-00264',N'Large',CONVERT(datetime2,N'2026-10-20 17:34:00',120),CONVERT(datetime2,N'2026-10-25 05:34:00',120),CONVERT(datetime2,N'2026-10-25 05:34:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-25 05:34:00',120)),
+(N'LP-SIM-00265',N'Medium',CONVERT(datetime2,N'2026-10-27 09:48:00',120),CONVERT(datetime2,N'2026-10-29 09:48:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-29 00:48:00',120)),
+(N'LP-SIM-00266',N'Medium',CONVERT(datetime2,N'2026-11-08 05:15:00',120),CONVERT(datetime2,N'2026-11-12 05:15:00',120),CONVERT(datetime2,N'2026-11-12 05:15:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-12 05:15:00',120)),
+(N'LP-SIM-00267',N'Medium',CONVERT(datetime2,N'2026-10-26 19:36:00',120),CONVERT(datetime2,N'2026-10-29 19:36:00',120),CONVERT(datetime2,N'2026-10-29 19:36:00',120),CONVERT(datetime2,N'2026-11-01 18:36:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-01 18:36:00',120)),
+(N'LP-SIM-00268',N'Small',CONVERT(datetime2,N'2026-11-07 18:22:00',120),CONVERT(datetime2,N'2026-11-08 18:22:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-08 06:22:00',120)),
+(N'LP-SIM-00269',N'Small',CONVERT(datetime2,N'2026-11-06 12:24:00',120),CONVERT(datetime2,N'2026-11-08 00:24:00',120),CONVERT(datetime2,N'2026-11-08 00:24:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-08 00:24:00',120)),
+(N'LP-SIM-00270',N'Small',CONVERT(datetime2,N'2026-11-06 03:09:00',120),CONVERT(datetime2,N'2026-11-07 07:09:00',120),CONVERT(datetime2,N'2026-11-07 07:09:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-07 07:09:00',120)),
+(N'LP-SIM-00271',N'Medium',CONVERT(datetime2,N'2026-11-06 22:32:00',120),CONVERT(datetime2,N'2026-11-08 01:32:00',120),CONVERT(datetime2,N'2026-11-08 01:32:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-08 01:32:00',120)),
+(N'LP-SIM-00272',N'Small',CONVERT(datetime2,N'2026-10-17 04:24:00',120),CONVERT(datetime2,N'2026-10-18 04:24:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-17 16:24:00',120)),
+(N'LP-SIM-00273',N'Small',CONVERT(datetime2,N'2026-11-07 00:13:00',120),CONVERT(datetime2,N'2026-11-10 00:13:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-09 22:13:00',120)),
+(N'LP-SIM-00274',N'Large',CONVERT(datetime2,N'2026-10-27 00:19:00',120),CONVERT(datetime2,N'2026-10-29 11:19:00',120),CONVERT(datetime2,N'2026-10-29 11:19:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-29 11:19:00',120)),
+(N'LP-SIM-00275',N'Small',CONVERT(datetime2,N'2026-11-02 14:09:00',120),CONVERT(datetime2,N'2026-11-06 14:09:00',120),CONVERT(datetime2,N'2026-11-06 14:09:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-13 14:09:00',120)),
+(N'LP-SIM-00276',N'Small',CONVERT(datetime2,N'2026-10-18 07:55:00',120),CONVERT(datetime2,N'2026-10-21 09:55:00',120),CONVERT(datetime2,N'2026-10-21 09:55:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-10-21 09:55:00',120)),
+(N'LP-SIM-00277',N'Medium',CONVERT(datetime2,N'2026-10-27 22:31:00',120),CONVERT(datetime2,N'2026-10-30 06:31:00',120),CONVERT(datetime2,N'2026-10-30 06:31:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-30 06:31:00',120)),
+(N'LP-SIM-00278',N'Medium',CONVERT(datetime2,N'2026-10-16 15:41:00',120),CONVERT(datetime2,N'2026-10-19 15:41:00',120),CONVERT(datetime2,N'2026-10-19 15:41:00',120),CONVERT(datetime2,N'2026-10-20 13:41:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-20 13:41:00',120)),
+(N'LP-SIM-00279',N'Small',CONVERT(datetime2,N'2026-11-03 14:55:00',120),CONVERT(datetime2,N'2026-11-05 22:55:00',120),CONVERT(datetime2,N'2026-11-05 22:55:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-05 22:55:00',120)),
+(N'LP-SIM-00280',N'Medium',CONVERT(datetime2,N'2026-10-30 18:13:00',120),CONVERT(datetime2,N'2026-10-31 20:13:00',120),CONVERT(datetime2,N'2026-10-31 20:13:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-31 20:13:00',120)),
+(N'LP-SIM-00281',N'Medium',CONVERT(datetime2,N'2026-11-02 14:34:00',120),CONVERT(datetime2,N'2026-11-06 14:34:00',120),CONVERT(datetime2,N'2026-11-06 14:34:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-13 14:34:00',120)),
+(N'LP-SIM-00282',N'Small',CONVERT(datetime2,N'2026-10-27 10:02:00',120),CONVERT(datetime2,N'2026-10-28 11:02:00',120),CONVERT(datetime2,N'2026-10-28 11:02:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-28 11:02:00',120)),
+(N'LP-SIM-00283',N'Medium',CONVERT(datetime2,N'2026-10-25 11:49:00',120),CONVERT(datetime2,N'2026-10-29 22:49:00',120),CONVERT(datetime2,N'2026-10-29 22:49:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-10-29 22:49:00',120)),
+(N'LP-SIM-00284',N'Small',CONVERT(datetime2,N'2026-11-11 02:42:00',120),CONVERT(datetime2,N'2026-11-13 02:42:00',120),CONVERT(datetime2,N'2026-11-13 02:42:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-20 02:42:00',120)),
+(N'LP-SIM-00285',N'Medium',CONVERT(datetime2,N'2026-10-26 02:50:00',120),CONVERT(datetime2,N'2026-10-29 14:50:00',120),CONVERT(datetime2,N'2026-10-29 14:50:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-10-29 14:50:00',120)),
+(N'LP-SIM-00286',N'Medium',CONVERT(datetime2,N'2026-11-08 17:41:00',120),CONVERT(datetime2,N'2026-11-09 17:41:00',120),CONVERT(datetime2,N'2026-11-09 17:41:00',120),CONVERT(datetime2,N'2026-11-12 12:41:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-12 12:41:00',120)),
+(N'LP-SIM-00287',N'Small',CONVERT(datetime2,N'2026-10-17 22:42:00',120),CONVERT(datetime2,N'2026-10-19 00:42:00',120),CONVERT(datetime2,N'2026-10-19 00:42:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-19 00:42:00',120)),
+(N'LP-SIM-00288',N'Small',CONVERT(datetime2,N'2026-10-21 18:06:00',120),CONVERT(datetime2,N'2026-10-25 02:06:00',120),CONVERT(datetime2,N'2026-10-25 02:06:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-25 02:06:00',120)),
+(N'LP-SIM-00289',N'Small',CONVERT(datetime2,N'2026-11-07 13:59:00',120),CONVERT(datetime2,N'2026-11-09 00:59:00',120),CONVERT(datetime2,N'2026-11-09 00:59:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-09 00:59:00',120)),
+(N'LP-SIM-00290',N'Medium',CONVERT(datetime2,N'2026-10-19 22:38:00',120),CONVERT(datetime2,N'2026-10-24 09:38:00',120),CONVERT(datetime2,N'2026-10-24 09:38:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-24 09:38:00',120)),
+(N'LP-SIM-00291',N'Medium',CONVERT(datetime2,N'2026-11-01 20:29:00',120),CONVERT(datetime2,N'2026-11-02 20:29:00',120),CONVERT(datetime2,N'2026-11-02 20:29:00',120),CONVERT(datetime2,N'2026-11-03 17:29:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-03 17:29:00',120)),
+(N'LP-SIM-00292',N'Small',CONVERT(datetime2,N'2026-10-21 20:46:00',120),CONVERT(datetime2,N'2026-10-23 07:46:00',120),CONVERT(datetime2,N'2026-10-23 07:46:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-23 07:46:00',120)),
+(N'LP-SIM-00293',N'Small',CONVERT(datetime2,N'2026-10-24 06:49:00',120),CONVERT(datetime2,N'2026-10-28 10:49:00',120),CONVERT(datetime2,N'2026-10-28 10:49:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-28 10:49:00',120)),
+(N'LP-SIM-00294',N'Medium',CONVERT(datetime2,N'2026-10-22 04:35:00',120),CONVERT(datetime2,N'2026-10-24 04:35:00',120),CONVERT(datetime2,N'2026-10-24 04:35:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-24 04:35:00',120)),
+(N'LP-SIM-00295',N'Medium',CONVERT(datetime2,N'2026-11-14 04:42:00',120),CONVERT(datetime2,N'2026-11-16 04:42:00',120),CONVERT(datetime2,N'2026-11-16 04:42:00',120),CONVERT(datetime2,N'2026-11-18 08:42:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-18 08:42:00',120)),
+(N'LP-SIM-00296',N'Medium',CONVERT(datetime2,N'2026-10-31 21:39:00',120),CONVERT(datetime2,N'2026-11-01 21:39:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-01 18:39:00',120)),
+(N'LP-SIM-00297',N'Medium',CONVERT(datetime2,N'2026-10-29 15:54:00',120),CONVERT(datetime2,N'2026-10-31 21:54:00',120),CONVERT(datetime2,N'2026-10-31 21:54:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-31 21:54:00',120)),
+(N'LP-SIM-00298',N'Small',CONVERT(datetime2,N'2026-10-29 00:13:00',120),CONVERT(datetime2,N'2026-11-01 12:13:00',120),CONVERT(datetime2,N'2026-11-01 12:13:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-01 12:13:00',120)),
+(N'LP-SIM-00299',N'Small',CONVERT(datetime2,N'2026-11-06 23:40:00',120),CONVERT(datetime2,N'2026-11-09 05:40:00',120),CONVERT(datetime2,N'2026-11-09 05:40:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-09 05:40:00',120)),
+(N'LP-SIM-00300',N'Small',CONVERT(datetime2,N'2026-10-16 03:29:00',120),CONVERT(datetime2,N'2026-10-20 13:29:00',120),CONVERT(datetime2,N'2026-10-20 13:29:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-20 13:29:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00301',N'Small',CONVERT(datetime2,N'2026-11-08 03:54:00',120),CONVERT(datetime2,N'2026-11-09 09:54:00',120),CONVERT(datetime2,N'2026-11-09 09:54:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-09 09:54:00',120)),
+(N'LP-SIM-00302',N'Medium',CONVERT(datetime2,N'2026-10-29 17:53:00',120),CONVERT(datetime2,N'2026-11-03 05:53:00',120),CONVERT(datetime2,N'2026-11-03 05:53:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-11-03 05:53:00',120)),
+(N'LP-SIM-00303',N'Medium',CONVERT(datetime2,N'2026-10-29 22:51:00',120),CONVERT(datetime2,N'2026-11-01 01:51:00',120),CONVERT(datetime2,N'2026-11-01 01:51:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-01 01:51:00',120)),
+(N'LP-SIM-00304',N'Medium',CONVERT(datetime2,N'2026-10-30 04:40:00',120),CONVERT(datetime2,N'2026-11-02 10:40:00',120),CONVERT(datetime2,N'2026-11-02 10:40:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-02 10:40:00',120)),
+(N'LP-SIM-00305',N'Large',CONVERT(datetime2,N'2026-10-21 23:30:00',120),CONVERT(datetime2,N'2026-10-25 10:30:00',120),CONVERT(datetime2,N'2026-10-25 10:30:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-25 10:30:00',120)),
+(N'LP-SIM-00306',N'Small',CONVERT(datetime2,N'2026-10-27 18:56:00',120),CONVERT(datetime2,N'2026-10-28 18:56:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-28 16:56:00',120)),
+(N'LP-SIM-00307',N'Large',CONVERT(datetime2,N'2026-11-01 07:12:00',120),CONVERT(datetime2,N'2026-11-02 18:12:00',120),CONVERT(datetime2,N'2026-11-02 18:12:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-02 18:12:00',120)),
+(N'LP-SIM-00308',N'Medium',CONVERT(datetime2,N'2026-11-08 07:33:00',120),CONVERT(datetime2,N'2026-11-12 07:33:00',120),CONVERT(datetime2,N'2026-11-12 07:33:00',120),CONVERT(datetime2,N'2026-11-15 07:33:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-15 07:33:00',120)),
+(N'LP-SIM-00309',N'Medium',CONVERT(datetime2,N'2026-10-25 07:52:00',120),CONVERT(datetime2,N'2026-10-26 07:52:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-25 20:52:00',120)),
+(N'LP-SIM-00310',N'Small',CONVERT(datetime2,N'2026-10-15 15:15:00',120),CONVERT(datetime2,N'2026-10-19 15:15:00',120),CONVERT(datetime2,N'2026-10-19 15:15:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-10-25 15:15:00',120)),
+(N'LP-SIM-00311',N'Medium',CONVERT(datetime2,N'2026-10-25 17:36:00',120),CONVERT(datetime2,N'2026-10-28 02:36:00',120),CONVERT(datetime2,N'2026-10-28 02:36:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-28 02:36:00',120)),
+(N'LP-SIM-00312',N'Small',CONVERT(datetime2,N'2026-10-25 15:48:00',120),CONVERT(datetime2,N'2026-10-27 02:48:00',120),CONVERT(datetime2,N'2026-10-27 02:48:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-27 02:48:00',120)),
+(N'LP-SIM-00313',N'Medium',CONVERT(datetime2,N'2026-10-27 12:06:00',120),CONVERT(datetime2,N'2026-10-31 20:06:00',120),CONVERT(datetime2,N'2026-10-31 20:06:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-31 20:06:00',120)),
+(N'LP-SIM-00314',N'Medium',CONVERT(datetime2,N'2026-11-06 19:15:00',120),CONVERT(datetime2,N'2026-11-10 19:15:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-10 09:15:00',120)),
+(N'LP-SIM-00315',N'Small',CONVERT(datetime2,N'2026-11-05 06:02:00',120),CONVERT(datetime2,N'2026-11-09 06:02:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-09 01:02:00',120)),
+(N'LP-SIM-00316',N'Small',CONVERT(datetime2,N'2026-10-24 03:46:00',120),CONVERT(datetime2,N'2026-10-26 03:46:00',120),CONVERT(datetime2,N'2026-10-26 03:46:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-10-29 03:46:00',120)),
+(N'LP-SIM-00317',N'Small',CONVERT(datetime2,N'2026-10-31 08:23:00',120),CONVERT(datetime2,N'2026-11-02 19:23:00',120),CONVERT(datetime2,N'2026-11-02 19:23:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-02 19:23:00',120)),
+(N'LP-SIM-00318',N'Small',CONVERT(datetime2,N'2026-11-05 00:37:00',120),CONVERT(datetime2,N'2026-11-08 09:37:00',120),CONVERT(datetime2,N'2026-11-08 09:37:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-08 09:37:00',120)),
+(N'LP-SIM-00319',N'Medium',CONVERT(datetime2,N'2026-11-13 00:04:00',120),CONVERT(datetime2,N'2026-11-16 04:04:00',120),CONVERT(datetime2,N'2026-11-16 04:04:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-16 04:04:00',120)),
+(N'LP-SIM-00320',N'Medium',CONVERT(datetime2,N'2026-11-10 23:33:00',120),CONVERT(datetime2,N'2026-11-12 09:33:00',120),CONVERT(datetime2,N'2026-11-12 09:33:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-12 09:33:00',120)),
+(N'LP-SIM-00321',N'Medium',CONVERT(datetime2,N'2026-11-05 09:50:00',120),CONVERT(datetime2,N'2026-11-09 09:50:00',120),CONVERT(datetime2,N'2026-11-09 09:50:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-09 09:50:00',120)),
+(N'LP-SIM-00322',N'Small',CONVERT(datetime2,N'2026-10-15 23:27:00',120),CONVERT(datetime2,N'2026-10-18 02:27:00',120),CONVERT(datetime2,N'2026-10-18 02:27:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-18 02:27:00',120)),
+(N'LP-SIM-00323',N'Small',CONVERT(datetime2,N'2026-11-12 23:00:00',120),CONVERT(datetime2,N'2026-11-14 23:00:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-14 14:00:00',120)),
+(N'LP-SIM-00324',N'Medium',CONVERT(datetime2,N'2026-10-28 01:37:00',120),CONVERT(datetime2,N'2026-10-29 06:37:00',120),CONVERT(datetime2,N'2026-10-29 06:37:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-29 06:37:00',120)),
+(N'LP-SIM-00325',N'Medium',CONVERT(datetime2,N'2026-10-29 10:30:00',120),CONVERT(datetime2,N'2026-10-30 15:30:00',120),CONVERT(datetime2,N'2026-10-30 15:30:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-30 15:30:00',120)),
+(N'LP-SIM-00326',N'Small',CONVERT(datetime2,N'2026-11-05 07:36:00',120),CONVERT(datetime2,N'2026-11-09 07:36:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-09 00:36:00',120)),
+(N'LP-SIM-00327',N'Small',CONVERT(datetime2,N'2026-10-20 07:44:00',120),CONVERT(datetime2,N'2026-10-21 17:44:00',120),CONVERT(datetime2,N'2026-10-21 17:44:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-21 17:44:00',120)),
+(N'LP-SIM-00328',N'Medium',CONVERT(datetime2,N'2026-10-30 22:14:00',120),CONVERT(datetime2,N'2026-11-04 02:14:00',120),CONVERT(datetime2,N'2026-11-04 02:14:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-04 02:14:00',120)),
+(N'LP-SIM-00329',N'Small',CONVERT(datetime2,N'2026-10-31 17:05:00',120),CONVERT(datetime2,N'2026-11-04 04:05:00',120),CONVERT(datetime2,N'2026-11-04 04:05:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-04 04:05:00',120)),
+(N'LP-SIM-00330',N'Large',CONVERT(datetime2,N'2026-11-06 01:39:00',120),CONVERT(datetime2,N'2026-11-08 10:39:00',120),CONVERT(datetime2,N'2026-11-08 10:39:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-08 10:39:00',120)),
+(N'LP-SIM-00331',N'Medium',CONVERT(datetime2,N'2026-10-16 15:25:00',120),CONVERT(datetime2,N'2026-10-19 17:25:00',120),CONVERT(datetime2,N'2026-10-19 17:25:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-19 17:25:00',120)),
+(N'LP-SIM-00332',N'Small',CONVERT(datetime2,N'2026-11-05 10:55:00',120),CONVERT(datetime2,N'2026-11-06 15:55:00',120),CONVERT(datetime2,N'2026-11-06 15:55:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-06 15:55:00',120)),
+(N'LP-SIM-00333',N'Small',CONVERT(datetime2,N'2026-10-25 13:36:00',120),CONVERT(datetime2,N'2026-10-27 19:36:00',120),CONVERT(datetime2,N'2026-10-27 19:36:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-27 19:36:00',120)),
+(N'LP-SIM-00334',N'Large',CONVERT(datetime2,N'2026-11-13 03:46:00',120),CONVERT(datetime2,N'2026-11-15 03:46:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-14 22:46:00',120)),
+(N'LP-SIM-00335',N'Medium',CONVERT(datetime2,N'2026-10-27 07:41:00',120),CONVERT(datetime2,N'2026-10-28 07:41:00',120),CONVERT(datetime2,N'2026-10-28 07:41:00',120),CONVERT(datetime2,N'2026-10-31 07:41:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-31 07:41:00',120)),
+(N'LP-SIM-00336',N'Small',CONVERT(datetime2,N'2026-11-02 01:26:00',120),CONVERT(datetime2,N'2026-11-04 01:26:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-03 21:26:00',120)),
+(N'LP-SIM-00337',N'Medium',CONVERT(datetime2,N'2026-11-12 05:51:00',120),CONVERT(datetime2,N'2026-11-14 11:51:00',120),CONVERT(datetime2,N'2026-11-14 11:51:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-14 11:51:00',120)),
+(N'LP-SIM-00338',N'Small',CONVERT(datetime2,N'2026-10-26 01:18:00',120),CONVERT(datetime2,N'2026-10-30 01:18:00',120),CONVERT(datetime2,N'2026-10-30 01:18:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-04 01:18:00',120)),
+(N'LP-SIM-00339',N'Medium',CONVERT(datetime2,N'2026-11-11 06:38:00',120),CONVERT(datetime2,N'2026-11-12 08:38:00',120),CONVERT(datetime2,N'2026-11-12 08:38:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-12 08:38:00',120)),
+(N'LP-SIM-00340',N'Small',CONVERT(datetime2,N'2026-11-08 17:57:00',120),CONVERT(datetime2,N'2026-11-09 17:57:00',120),CONVERT(datetime2,N'2026-11-09 17:57:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-16 17:57:00',120)),
+(N'LP-SIM-00341',N'Medium',CONVERT(datetime2,N'2026-11-11 06:52:00',120),CONVERT(datetime2,N'2026-11-14 15:52:00',120),CONVERT(datetime2,N'2026-11-14 15:52:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-14 15:52:00',120)),
+(N'LP-SIM-00342',N'Small',CONVERT(datetime2,N'2026-11-03 22:55:00',120),CONVERT(datetime2,N'2026-11-06 09:55:00',120),CONVERT(datetime2,N'2026-11-06 09:55:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-06 09:55:00',120)),
+(N'LP-SIM-00343',N'Small',CONVERT(datetime2,N'2026-11-01 17:33:00',120),CONVERT(datetime2,N'2026-11-02 17:33:00',120),CONVERT(datetime2,N'2026-11-02 17:33:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-02 17:33:00',120)),
+(N'LP-SIM-00344',N'Large',CONVERT(datetime2,N'2026-10-20 00:48:00',120),CONVERT(datetime2,N'2026-10-23 00:48:00',120),CONVERT(datetime2,N'2026-10-23 00:48:00',120),CONVERT(datetime2,N'2026-10-24 18:48:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-24 18:48:00',120)),
+(N'LP-SIM-00345',N'Medium',CONVERT(datetime2,N'2026-11-06 21:19:00',120),CONVERT(datetime2,N'2026-11-09 23:19:00',120),CONVERT(datetime2,N'2026-11-09 23:19:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-09 23:19:00',120)),
+(N'LP-SIM-00346',N'Medium',CONVERT(datetime2,N'2026-11-03 13:53:00',120),CONVERT(datetime2,N'2026-11-07 13:53:00',120),CONVERT(datetime2,N'2026-11-07 13:53:00',120),CONVERT(datetime2,N'2026-11-09 00:53:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-09 00:53:00',120)),
+(N'LP-SIM-00347',N'Small',CONVERT(datetime2,N'2026-10-16 08:16:00',120),CONVERT(datetime2,N'2026-10-17 10:16:00',120),CONVERT(datetime2,N'2026-10-17 10:16:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-17 10:16:00',120)),
+(N'LP-SIM-00348',N'Large',CONVERT(datetime2,N'2026-11-04 06:06:00',120),CONVERT(datetime2,N'2026-11-08 06:06:00',120),CONVERT(datetime2,N'2026-11-08 06:06:00',120),CONVERT(datetime2,N'2026-11-11 02:06:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-11 02:06:00',120)),
+(N'LP-SIM-00349',N'Medium',CONVERT(datetime2,N'2026-10-23 01:32:00',120),CONVERT(datetime2,N'2026-10-24 06:32:00',120),CONVERT(datetime2,N'2026-10-24 06:32:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-24 06:32:00',120)),
+(N'LP-SIM-00350',N'Small',CONVERT(datetime2,N'2026-11-06 04:47:00',120),CONVERT(datetime2,N'2026-11-09 04:47:00',120),CONVERT(datetime2,N'2026-11-09 04:47:00',120),CONVERT(datetime2,N'2026-11-10 08:47:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-10 08:47:00',120)),
+(N'LP-SIM-00351',N'Large',CONVERT(datetime2,N'2026-10-31 03:10:00',120),CONVERT(datetime2,N'2026-11-04 03:10:00',120),CONVERT(datetime2,N'2026-11-04 03:10:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-04 03:10:00',120)),
+(N'LP-SIM-00352',N'Large',CONVERT(datetime2,N'2026-10-25 02:52:00',120),CONVERT(datetime2,N'2026-10-28 02:52:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-27 15:52:00',120)),
+(N'LP-SIM-00353',N'Medium',CONVERT(datetime2,N'2026-11-03 02:17:00',120),CONVERT(datetime2,N'2026-11-06 11:17:00',120),CONVERT(datetime2,N'2026-11-06 11:17:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-06 11:17:00',120)),
+(N'LP-SIM-00354',N'Large',CONVERT(datetime2,N'2026-10-20 06:50:00',120),CONVERT(datetime2,N'2026-10-22 06:50:00',120),CONVERT(datetime2,N'2026-10-22 06:50:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-22 06:50:00',120)),
+(N'LP-SIM-00355',N'Large',CONVERT(datetime2,N'2026-11-06 03:04:00',120),CONVERT(datetime2,N'2026-11-07 05:04:00',120),CONVERT(datetime2,N'2026-11-07 05:04:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-07 05:04:00',120)),
+(N'LP-SIM-00356',N'Large',CONVERT(datetime2,N'2026-10-29 01:53:00',120),CONVERT(datetime2,N'2026-10-30 12:53:00',120),CONVERT(datetime2,N'2026-10-30 12:53:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-30 12:53:00',120)),
+(N'LP-SIM-00357',N'Large',CONVERT(datetime2,N'2026-11-10 01:10:00',120),CONVERT(datetime2,N'2026-11-13 08:10:00',120),CONVERT(datetime2,N'2026-11-13 08:10:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-13 08:10:00',120)),
+(N'LP-SIM-00358',N'Small',CONVERT(datetime2,N'2026-11-05 11:11:00',120),CONVERT(datetime2,N'2026-11-09 11:11:00',120),CONVERT(datetime2,N'2026-11-09 11:11:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-09 11:11:00',120)),
+(N'LP-SIM-00359',N'Small',CONVERT(datetime2,N'2026-11-13 21:03:00',120),CONVERT(datetime2,N'2026-11-16 21:03:00',120),CONVERT(datetime2,N'2026-11-16 21:03:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-16 21:03:00',120)),
+(N'LP-SIM-00360',N'Small',CONVERT(datetime2,N'2026-10-19 11:12:00',120),CONVERT(datetime2,N'2026-10-21 14:12:00',120),CONVERT(datetime2,N'2026-10-21 14:12:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-21 14:12:00',120)),
+(N'LP-SIM-00361',N'Large',CONVERT(datetime2,N'2026-11-03 02:14:00',120),CONVERT(datetime2,N'2026-11-04 14:14:00',120),CONVERT(datetime2,N'2026-11-04 14:14:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-04 14:14:00',120)),
+(N'LP-SIM-00362',N'Small',CONVERT(datetime2,N'2026-10-23 04:34:00',120),CONVERT(datetime2,N'2026-10-26 04:34:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-26 03:34:00',120)),
+(N'LP-SIM-00363',N'Large',CONVERT(datetime2,N'2026-10-26 17:21:00',120),CONVERT(datetime2,N'2026-10-28 21:21:00',120),CONVERT(datetime2,N'2026-10-28 21:21:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-28 21:21:00',120)),
+(N'LP-SIM-00364',N'Medium',CONVERT(datetime2,N'2026-11-05 07:54:00',120),CONVERT(datetime2,N'2026-11-06 17:54:00',120),CONVERT(datetime2,N'2026-11-06 17:54:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-06 17:54:00',120)),
+(N'LP-SIM-00365',N'Medium',CONVERT(datetime2,N'2026-11-04 12:58:00',120),CONVERT(datetime2,N'2026-11-08 12:58:00',120),CONVERT(datetime2,N'2026-11-08 12:58:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-11-15 12:58:00',120)),
+(N'LP-SIM-00366',N'Small',CONVERT(datetime2,N'2026-10-21 12:39:00',120),CONVERT(datetime2,N'2026-10-25 12:39:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-25 01:39:00',120)),
+(N'LP-SIM-00367',N'Medium',CONVERT(datetime2,N'2026-11-09 10:12:00',120),CONVERT(datetime2,N'2026-11-11 10:12:00',120),CONVERT(datetime2,N'2026-11-11 10:12:00',120),CONVERT(datetime2,N'2026-11-12 18:12:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-12 18:12:00',120)),
+(N'LP-SIM-00368',N'Small',CONVERT(datetime2,N'2026-11-08 08:56:00',120),CONVERT(datetime2,N'2026-11-10 08:56:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 05:56:00',120)),
+(N'LP-SIM-00369',N'Large',CONVERT(datetime2,N'2026-11-01 10:51:00',120),CONVERT(datetime2,N'2026-11-04 20:51:00',120),CONVERT(datetime2,N'2026-11-04 20:51:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-04 20:51:00',120)),
+(N'LP-SIM-00370',N'Small',CONVERT(datetime2,N'2026-11-01 10:20:00',120),CONVERT(datetime2,N'2026-11-02 19:20:00',120),CONVERT(datetime2,N'2026-11-02 19:20:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-02 19:20:00',120)),
+(N'LP-SIM-00371',N'Large',CONVERT(datetime2,N'2026-11-11 13:48:00',120),CONVERT(datetime2,N'2026-11-13 20:48:00',120),CONVERT(datetime2,N'2026-11-13 20:48:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-13 20:48:00',120)),
+(N'LP-SIM-00372',N'Medium',CONVERT(datetime2,N'2026-11-04 20:27:00',120),CONVERT(datetime2,N'2026-11-07 20:27:00',120),CONVERT(datetime2,N'2026-11-07 20:27:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-07 20:27:00',120)),
+(N'LP-SIM-00373',N'Small',CONVERT(datetime2,N'2026-11-11 15:52:00',120),CONVERT(datetime2,N'2026-11-14 15:52:00',120),CONVERT(datetime2,N'2026-11-14 15:52:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-14 15:52:00',120)),
+(N'LP-SIM-00374',N'Large',CONVERT(datetime2,N'2026-10-28 10:07:00',120),CONVERT(datetime2,N'2026-10-29 11:07:00',120),CONVERT(datetime2,N'2026-10-29 11:07:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-29 11:07:00',120)),
+(N'LP-SIM-00375',N'Medium',CONVERT(datetime2,N'2026-10-22 11:16:00',120),CONVERT(datetime2,N'2026-10-24 19:16:00',120),CONVERT(datetime2,N'2026-10-24 19:16:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-24 19:16:00',120)),
+(N'LP-SIM-00376',N'Medium',CONVERT(datetime2,N'2026-10-31 20:54:00',120),CONVERT(datetime2,N'2026-11-01 22:54:00',120),CONVERT(datetime2,N'2026-11-01 22:54:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-01 22:54:00',120)),
+(N'LP-SIM-00377',N'Small',CONVERT(datetime2,N'2026-10-24 17:32:00',120),CONVERT(datetime2,N'2026-10-25 17:32:00',120),CONVERT(datetime2,N'2026-10-25 17:32:00',120),CONVERT(datetime2,N'2026-10-27 19:32:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-27 19:32:00',120)),
+(N'LP-SIM-00378',N'Small',CONVERT(datetime2,N'2026-11-11 01:25:00',120),CONVERT(datetime2,N'2026-11-12 11:25:00',120),CONVERT(datetime2,N'2026-11-12 11:25:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-11-12 11:25:00',120)),
+(N'LP-SIM-00379',N'Small',CONVERT(datetime2,N'2026-11-03 02:49:00',120),CONVERT(datetime2,N'2026-11-07 08:49:00',120),CONVERT(datetime2,N'2026-11-07 08:49:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-07 08:49:00',120)),
+(N'LP-SIM-00380',N'Small',CONVERT(datetime2,N'2026-10-18 12:03:00',120),CONVERT(datetime2,N'2026-10-20 12:03:00',120),CONVERT(datetime2,N'2026-10-20 12:03:00',120),CONVERT(datetime2,N'2026-10-22 18:03:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-22 18:03:00',120)),
+(N'LP-SIM-00381',N'Medium',CONVERT(datetime2,N'2026-10-27 19:05:00',120),CONVERT(datetime2,N'2026-10-31 20:05:00',120),CONVERT(datetime2,N'2026-10-31 20:05:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-31 20:05:00',120)),
+(N'LP-SIM-00382',N'Large',CONVERT(datetime2,N'2026-11-08 10:15:00',120),CONVERT(datetime2,N'2026-11-11 10:15:00',120),CONVERT(datetime2,N'2026-11-11 10:15:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-11-15 10:15:00',120)),
+(N'LP-SIM-00383',N'Medium',CONVERT(datetime2,N'2026-11-13 09:19:00',120),CONVERT(datetime2,N'2026-11-17 21:19:00',120),CONVERT(datetime2,N'2026-11-17 21:19:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-17 21:19:00',120)),
+(N'LP-SIM-00384',N'Large',CONVERT(datetime2,N'2026-11-12 05:12:00',120),CONVERT(datetime2,N'2026-11-14 07:12:00',120),CONVERT(datetime2,N'2026-11-14 07:12:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-14 07:12:00',120)),
+(N'LP-SIM-00385',N'Medium',CONVERT(datetime2,N'2026-11-10 02:16:00',120),CONVERT(datetime2,N'2026-11-11 02:16:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 22:16:00',120)),
+(N'LP-SIM-00386',N'Large',CONVERT(datetime2,N'2026-10-18 13:40:00',120),CONVERT(datetime2,N'2026-10-22 15:40:00',120),CONVERT(datetime2,N'2026-10-22 15:40:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-22 15:40:00',120)),
+(N'LP-SIM-00387',N'Medium',CONVERT(datetime2,N'2026-10-17 19:20:00',120),CONVERT(datetime2,N'2026-10-21 19:20:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-21 13:20:00',120)),
+(N'LP-SIM-00388',N'Large',CONVERT(datetime2,N'2026-11-10 21:14:00',120),CONVERT(datetime2,N'2026-11-15 05:14:00',120),CONVERT(datetime2,N'2026-11-15 05:14:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-15 05:14:00',120)),
+(N'LP-SIM-00389',N'Medium',CONVERT(datetime2,N'2026-10-30 19:44:00',120),CONVERT(datetime2,N'2026-11-01 06:44:00',120),CONVERT(datetime2,N'2026-11-01 06:44:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-01 06:44:00',120)),
+(N'LP-SIM-00390',N'Medium',CONVERT(datetime2,N'2026-10-30 02:57:00',120),CONVERT(datetime2,N'2026-10-31 07:57:00',120),CONVERT(datetime2,N'2026-10-31 07:57:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-31 07:57:00',120)),
+(N'LP-SIM-00391',N'Small',CONVERT(datetime2,N'2026-10-16 03:40:00',120),CONVERT(datetime2,N'2026-10-20 08:40:00',120),CONVERT(datetime2,N'2026-10-20 08:40:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-20 08:40:00',120)),
+(N'LP-SIM-00392',N'Medium',CONVERT(datetime2,N'2026-10-18 00:15:00',120),CONVERT(datetime2,N'2026-10-20 00:15:00',120),CONVERT(datetime2,N'2026-10-20 00:15:00',120),CONVERT(datetime2,N'2026-10-21 04:15:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-21 04:15:00',120)),
+(N'LP-SIM-00393',N'Small',CONVERT(datetime2,N'2026-10-31 18:03:00',120),CONVERT(datetime2,N'2026-11-03 18:03:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-03 12:03:00',120)),
+(N'LP-SIM-00394',N'Large',CONVERT(datetime2,N'2026-10-28 12:22:00',120),CONVERT(datetime2,N'2026-10-31 18:22:00',120),CONVERT(datetime2,N'2026-10-31 18:22:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-31 18:22:00',120)),
+(N'LP-SIM-00395',N'Small',CONVERT(datetime2,N'2026-10-19 08:08:00',120),CONVERT(datetime2,N'2026-10-23 08:08:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-22 20:08:00',120)),
+(N'LP-SIM-00396',N'Medium',CONVERT(datetime2,N'2026-11-10 15:50:00',120),CONVERT(datetime2,N'2026-11-11 19:50:00',120),CONVERT(datetime2,N'2026-11-11 19:50:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-11 19:50:00',120)),
+(N'LP-SIM-00397',N'Medium',CONVERT(datetime2,N'2026-10-21 17:21:00',120),CONVERT(datetime2,N'2026-10-25 17:21:00',120),CONVERT(datetime2,N'2026-10-25 17:21:00',120),CONVERT(datetime2,N'2026-10-28 01:21:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-28 01:21:00',120)),
+(N'LP-SIM-00398',N'Large',CONVERT(datetime2,N'2026-11-10 02:31:00',120),CONVERT(datetime2,N'2026-11-12 06:31:00',120),CONVERT(datetime2,N'2026-11-12 06:31:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-12 06:31:00',120)),
+(N'LP-SIM-00399',N'Medium',CONVERT(datetime2,N'2026-10-17 21:51:00',120),CONVERT(datetime2,N'2026-10-20 01:51:00',120),CONVERT(datetime2,N'2026-10-20 01:51:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-20 01:51:00',120)),
+(N'LP-SIM-00400',N'Medium',CONVERT(datetime2,N'2026-10-19 12:56:00',120),CONVERT(datetime2,N'2026-10-20 18:56:00',120),CONVERT(datetime2,N'2026-10-20 18:56:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-20 18:56:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00401',N'Medium',CONVERT(datetime2,N'2026-10-28 15:51:00',120),CONVERT(datetime2,N'2026-10-31 16:51:00',120),CONVERT(datetime2,N'2026-10-31 16:51:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-31 16:51:00',120)),
+(N'LP-SIM-00402',N'Small',CONVERT(datetime2,N'2026-10-19 21:19:00',120),CONVERT(datetime2,N'2026-10-22 09:19:00',120),CONVERT(datetime2,N'2026-10-22 09:19:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-10-22 09:19:00',120)),
+(N'LP-SIM-00403',N'Medium',CONVERT(datetime2,N'2026-10-21 14:34:00',120),CONVERT(datetime2,N'2026-10-25 02:34:00',120),CONVERT(datetime2,N'2026-10-25 02:34:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-25 02:34:00',120)),
+(N'LP-SIM-00404',N'Small',CONVERT(datetime2,N'2026-11-10 18:25:00',120),CONVERT(datetime2,N'2026-11-11 19:25:00',120),CONVERT(datetime2,N'2026-11-11 19:25:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-11 19:25:00',120)),
+(N'LP-SIM-00405',N'Large',CONVERT(datetime2,N'2026-10-27 06:47:00',120),CONVERT(datetime2,N'2026-10-31 13:47:00',120),CONVERT(datetime2,N'2026-10-31 13:47:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-31 13:47:00',120)),
+(N'LP-SIM-00406',N'Small',CONVERT(datetime2,N'2026-10-25 10:44:00',120),CONVERT(datetime2,N'2026-10-29 22:44:00',120),CONVERT(datetime2,N'2026-10-29 22:44:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-29 22:44:00',120)),
+(N'LP-SIM-00407',N'Small',CONVERT(datetime2,N'2026-10-22 23:44:00',120),CONVERT(datetime2,N'2026-10-24 04:44:00',120),CONVERT(datetime2,N'2026-10-24 04:44:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-24 04:44:00',120)),
+(N'LP-SIM-00408',N'Medium',CONVERT(datetime2,N'2026-10-18 23:20:00',120),CONVERT(datetime2,N'2026-10-21 08:20:00',120),CONVERT(datetime2,N'2026-10-21 08:20:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-21 08:20:00',120)),
+(N'LP-SIM-00409',N'Large',CONVERT(datetime2,N'2026-10-26 19:20:00',120),CONVERT(datetime2,N'2026-10-27 19:20:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-27 17:20:00',120)),
+(N'LP-SIM-00410',N'Medium',CONVERT(datetime2,N'2026-10-31 05:08:00',120),CONVERT(datetime2,N'2026-11-03 08:08:00',120),CONVERT(datetime2,N'2026-11-03 08:08:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-03 08:08:00',120)),
+(N'LP-SIM-00411',N'Large',CONVERT(datetime2,N'2026-11-06 06:40:00',120),CONVERT(datetime2,N'2026-11-09 06:40:00',120),CONVERT(datetime2,N'2026-11-09 06:40:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-09 06:40:00',120)),
+(N'LP-SIM-00412',N'Large',CONVERT(datetime2,N'2026-10-16 22:39:00',120),CONVERT(datetime2,N'2026-10-21 04:39:00',120),CONVERT(datetime2,N'2026-10-21 04:39:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-21 04:39:00',120)),
+(N'LP-SIM-00413',N'Medium',CONVERT(datetime2,N'2026-10-15 11:17:00',120),CONVERT(datetime2,N'2026-10-18 11:17:00',120),CONVERT(datetime2,N'2026-10-18 11:17:00',120),CONVERT(datetime2,N'2026-10-19 03:17:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-19 03:17:00',120)),
+(N'LP-SIM-00414',N'Small',CONVERT(datetime2,N'2026-11-02 05:45:00',120),CONVERT(datetime2,N'2026-11-03 05:45:00',120),CONVERT(datetime2,N'2026-11-03 05:45:00',120),CONVERT(datetime2,N'2026-11-03 15:45:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-03 15:45:00',120)),
+(N'LP-SIM-00415',N'Medium',CONVERT(datetime2,N'2026-11-13 10:16:00',120),CONVERT(datetime2,N'2026-11-15 14:16:00',120),CONVERT(datetime2,N'2026-11-15 14:16:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-11-15 14:16:00',120)),
+(N'LP-SIM-00416',N'Medium',CONVERT(datetime2,N'2026-11-11 10:26:00',120),CONVERT(datetime2,N'2026-11-13 15:26:00',120),CONVERT(datetime2,N'2026-11-13 15:26:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-13 15:26:00',120)),
+(N'LP-SIM-00417',N'Large',CONVERT(datetime2,N'2026-10-28 01:50:00',120),CONVERT(datetime2,N'2026-10-29 01:50:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-28 19:50:00',120)),
+(N'LP-SIM-00418',N'Large',CONVERT(datetime2,N'2026-11-06 04:55:00',120),CONVERT(datetime2,N'2026-11-09 08:55:00',120),CONVERT(datetime2,N'2026-11-09 08:55:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-09 08:55:00',120)),
+(N'LP-SIM-00419',N'Small',CONVERT(datetime2,N'2026-10-30 08:23:00',120),CONVERT(datetime2,N'2026-10-31 16:23:00',120),CONVERT(datetime2,N'2026-10-31 16:23:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-31 16:23:00',120)),
+(N'LP-SIM-00420',N'Small',CONVERT(datetime2,N'2026-11-06 18:48:00',120),CONVERT(datetime2,N'2026-11-09 05:48:00',120),CONVERT(datetime2,N'2026-11-09 05:48:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-09 05:48:00',120)),
+(N'LP-SIM-00421',N'Small',CONVERT(datetime2,N'2026-11-10 01:39:00',120),CONVERT(datetime2,N'2026-11-14 08:39:00',120),CONVERT(datetime2,N'2026-11-14 08:39:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-14 08:39:00',120)),
+(N'LP-SIM-00422',N'Medium',CONVERT(datetime2,N'2026-10-19 16:30:00',120),CONVERT(datetime2,N'2026-10-24 03:30:00',120),CONVERT(datetime2,N'2026-10-24 03:30:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-24 03:30:00',120)),
+(N'LP-SIM-00423',N'Medium',CONVERT(datetime2,N'2026-11-07 14:34:00',120),CONVERT(datetime2,N'2026-11-08 21:34:00',120),CONVERT(datetime2,N'2026-11-08 21:34:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-08 21:34:00',120)),
+(N'LP-SIM-00424',N'Small',CONVERT(datetime2,N'2026-10-27 03:59:00',120),CONVERT(datetime2,N'2026-10-30 03:59:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 15:59:00',120)),
+(N'LP-SIM-00425',N'Small',CONVERT(datetime2,N'2026-11-08 04:44:00',120),CONVERT(datetime2,N'2026-11-10 09:44:00',120),CONVERT(datetime2,N'2026-11-10 09:44:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-10 09:44:00',120)),
+(N'LP-SIM-00426',N'Medium',CONVERT(datetime2,N'2026-11-08 09:41:00',120),CONVERT(datetime2,N'2026-11-11 14:41:00',120),CONVERT(datetime2,N'2026-11-11 14:41:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-11 14:41:00',120)),
+(N'LP-SIM-00427',N'Small',CONVERT(datetime2,N'2026-11-06 21:56:00',120),CONVERT(datetime2,N'2026-11-09 21:56:00',120),CONVERT(datetime2,N'2026-11-09 21:56:00',120),CONVERT(datetime2,N'2026-11-11 03:56:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-11 03:56:00',120)),
+(N'LP-SIM-00428',N'Large',CONVERT(datetime2,N'2026-10-25 19:19:00',120),CONVERT(datetime2,N'2026-10-29 19:19:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-29 09:19:00',120)),
+(N'LP-SIM-00429',N'Small',CONVERT(datetime2,N'2026-11-07 14:43:00',120),CONVERT(datetime2,N'2026-11-12 00:43:00',120),CONVERT(datetime2,N'2026-11-12 00:43:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-12 00:43:00',120)),
+(N'LP-SIM-00430',N'Large',CONVERT(datetime2,N'2026-11-11 00:36:00',120),CONVERT(datetime2,N'2026-11-15 02:36:00',120),CONVERT(datetime2,N'2026-11-15 02:36:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-15 02:36:00',120)),
+(N'LP-SIM-00431',N'Small',CONVERT(datetime2,N'2026-10-27 10:45:00',120),CONVERT(datetime2,N'2026-10-31 13:45:00',120),CONVERT(datetime2,N'2026-10-31 13:45:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-31 13:45:00',120)),
+(N'LP-SIM-00432',N'Large',CONVERT(datetime2,N'2026-11-12 22:04:00',120),CONVERT(datetime2,N'2026-11-17 00:04:00',120),CONVERT(datetime2,N'2026-11-17 00:04:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-17 00:04:00',120)),
+(N'LP-SIM-00433',N'Small',CONVERT(datetime2,N'2026-10-19 21:36:00',120),CONVERT(datetime2,N'2026-10-23 08:36:00',120),CONVERT(datetime2,N'2026-10-23 08:36:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-23 08:36:00',120)),
+(N'LP-SIM-00434',N'Small',CONVERT(datetime2,N'2026-11-01 21:41:00',120),CONVERT(datetime2,N'2026-11-03 21:41:00',120),CONVERT(datetime2,N'2026-11-03 21:41:00',120),CONVERT(datetime2,N'2026-11-05 13:41:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-05 13:41:00',120)),
+(N'LP-SIM-00435',N'Small',CONVERT(datetime2,N'2026-10-22 18:46:00',120),CONVERT(datetime2,N'2026-10-25 01:46:00',120),CONVERT(datetime2,N'2026-10-25 01:46:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-25 01:46:00',120)),
+(N'LP-SIM-00436',N'Medium',CONVERT(datetime2,N'2026-10-17 07:59:00',120),CONVERT(datetime2,N'2026-10-19 07:59:00',120),CONVERT(datetime2,N'2026-10-19 07:59:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-19 07:59:00',120)),
+(N'LP-SIM-00437',N'Medium',CONVERT(datetime2,N'2026-10-25 11:54:00',120),CONVERT(datetime2,N'2026-10-26 18:54:00',120),CONVERT(datetime2,N'2026-10-26 18:54:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-26 18:54:00',120)),
+(N'LP-SIM-00438',N'Small',CONVERT(datetime2,N'2026-11-11 20:45:00',120),CONVERT(datetime2,N'2026-11-12 20:45:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-12 10:45:00',120)),
+(N'LP-SIM-00439',N'Large',CONVERT(datetime2,N'2026-10-25 20:08:00',120),CONVERT(datetime2,N'2026-10-26 21:08:00',120),CONVERT(datetime2,N'2026-10-26 21:08:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-26 21:08:00',120)),
+(N'LP-SIM-00440',N'Medium',CONVERT(datetime2,N'2026-10-25 14:39:00',120),CONVERT(datetime2,N'2026-10-28 21:39:00',120),CONVERT(datetime2,N'2026-10-28 21:39:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-10-28 21:39:00',120)),
+(N'LP-SIM-00441',N'Medium',CONVERT(datetime2,N'2026-11-09 09:21:00',120),CONVERT(datetime2,N'2026-11-13 19:21:00',120),CONVERT(datetime2,N'2026-11-13 19:21:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-13 19:21:00',120)),
+(N'LP-SIM-00442',N'Large',CONVERT(datetime2,N'2026-11-10 21:58:00',120),CONVERT(datetime2,N'2026-11-13 03:58:00',120),CONVERT(datetime2,N'2026-11-13 03:58:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-13 03:58:00',120)),
+(N'LP-SIM-00443',N'Medium',CONVERT(datetime2,N'2026-10-19 05:33:00',120),CONVERT(datetime2,N'2026-10-21 15:33:00',120),CONVERT(datetime2,N'2026-10-21 15:33:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-21 15:33:00',120)),
+(N'LP-SIM-00444',N'Small',CONVERT(datetime2,N'2026-11-10 07:26:00',120),CONVERT(datetime2,N'2026-11-13 07:26:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-12 19:26:00',120)),
+(N'LP-SIM-00445',N'Large',CONVERT(datetime2,N'2026-10-22 17:40:00',120),CONVERT(datetime2,N'2026-10-24 19:40:00',120),CONVERT(datetime2,N'2026-10-24 19:40:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-24 19:40:00',120)),
+(N'LP-SIM-00446',N'Large',CONVERT(datetime2,N'2026-11-08 01:05:00',120),CONVERT(datetime2,N'2026-11-09 01:05:00',120),CONVERT(datetime2,N'2026-11-09 01:05:00',120),CONVERT(datetime2,N'2026-11-10 13:05:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-10 13:05:00',120)),
+(N'LP-SIM-00447',N'Small',CONVERT(datetime2,N'2026-11-04 02:10:00',120),CONVERT(datetime2,N'2026-11-05 02:10:00',120),CONVERT(datetime2,N'2026-11-05 02:10:00',120),CONVERT(datetime2,N'2026-11-07 18:10:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-07 18:10:00',120)),
+(N'LP-SIM-00448',N'Small',CONVERT(datetime2,N'2026-10-30 06:28:00',120),CONVERT(datetime2,N'2026-11-02 06:28:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-01 19:28:00',120)),
+(N'LP-SIM-00449',N'Medium',CONVERT(datetime2,N'2026-10-26 09:30:00',120),CONVERT(datetime2,N'2026-10-28 19:30:00',120),CONVERT(datetime2,N'2026-10-28 19:30:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-28 19:30:00',120)),
+(N'LP-SIM-00450',N'Medium',CONVERT(datetime2,N'2026-11-12 02:52:00',120),CONVERT(datetime2,N'2026-11-15 08:52:00',120),CONVERT(datetime2,N'2026-11-15 08:52:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-15 08:52:00',120)),
+(N'LP-SIM-00451',N'Small',CONVERT(datetime2,N'2026-10-25 04:13:00',120),CONVERT(datetime2,N'2026-10-26 08:13:00',120),CONVERT(datetime2,N'2026-10-26 08:13:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-26 08:13:00',120)),
+(N'LP-SIM-00452',N'Large',CONVERT(datetime2,N'2026-10-20 05:50:00',120),CONVERT(datetime2,N'2026-10-24 12:50:00',120),CONVERT(datetime2,N'2026-10-24 12:50:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-10-24 12:50:00',120)),
+(N'LP-SIM-00453',N'Medium',CONVERT(datetime2,N'2026-11-05 14:57:00',120),CONVERT(datetime2,N'2026-11-09 17:57:00',120),CONVERT(datetime2,N'2026-11-09 17:57:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-09 17:57:00',120)),
+(N'LP-SIM-00454',N'Large',CONVERT(datetime2,N'2026-11-13 16:07:00',120),CONVERT(datetime2,N'2026-11-17 22:07:00',120),CONVERT(datetime2,N'2026-11-17 22:07:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-11-17 22:07:00',120)),
+(N'LP-SIM-00455',N'Small',CONVERT(datetime2,N'2026-11-05 21:24:00',120),CONVERT(datetime2,N'2026-11-07 21:24:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-07 11:24:00',120)),
+(N'LP-SIM-00456',N'Large',CONVERT(datetime2,N'2026-10-19 02:20:00',120),CONVERT(datetime2,N'2026-10-21 08:20:00',120),CONVERT(datetime2,N'2026-10-21 08:20:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-21 08:20:00',120)),
+(N'LP-SIM-00457',N'Large',CONVERT(datetime2,N'2026-10-29 05:12:00',120),CONVERT(datetime2,N'2026-10-30 12:12:00',120),CONVERT(datetime2,N'2026-10-30 12:12:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-30 12:12:00',120)),
+(N'LP-SIM-00458',N'Small',CONVERT(datetime2,N'2026-10-24 04:07:00',120),CONVERT(datetime2,N'2026-10-28 12:07:00',120),CONVERT(datetime2,N'2026-10-28 12:07:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-28 12:07:00',120)),
+(N'LP-SIM-00459',N'Small',CONVERT(datetime2,N'2026-11-08 13:25:00',120),CONVERT(datetime2,N'2026-11-13 00:25:00',120),CONVERT(datetime2,N'2026-11-13 00:25:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-13 00:25:00',120)),
+(N'LP-SIM-00460',N'Medium',CONVERT(datetime2,N'2026-10-27 11:59:00',120),CONVERT(datetime2,N'2026-10-28 18:59:00',120),CONVERT(datetime2,N'2026-10-28 18:59:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-28 18:59:00',120)),
+(N'LP-SIM-00461',N'Medium',CONVERT(datetime2,N'2026-10-15 15:35:00',120),CONVERT(datetime2,N'2026-10-17 15:35:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-17 07:35:00',120)),
+(N'LP-SIM-00462',N'Small',CONVERT(datetime2,N'2026-11-08 12:33:00',120),CONVERT(datetime2,N'2026-11-10 12:33:00',120),CONVERT(datetime2,N'2026-11-10 12:33:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-14 12:33:00',120)),
+(N'LP-SIM-00463',N'Small',CONVERT(datetime2,N'2026-11-09 08:33:00',120),CONVERT(datetime2,N'2026-11-13 08:33:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-13 06:33:00',120)),
+(N'LP-SIM-00464',N'Small',CONVERT(datetime2,N'2026-11-01 15:36:00',120),CONVERT(datetime2,N'2026-11-04 17:36:00',120),CONVERT(datetime2,N'2026-11-04 17:36:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-04 17:36:00',120)),
+(N'LP-SIM-00465',N'Large',CONVERT(datetime2,N'2026-11-07 21:56:00',120),CONVERT(datetime2,N'2026-11-10 21:56:00',120),CONVERT(datetime2,N'2026-11-10 21:56:00',120),CONVERT(datetime2,N'2026-11-12 01:56:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-12 01:56:00',120)),
+(N'LP-SIM-00466',N'Medium',CONVERT(datetime2,N'2026-10-31 05:28:00',120),CONVERT(datetime2,N'2026-11-01 10:28:00',120),CONVERT(datetime2,N'2026-11-01 10:28:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-01 10:28:00',120)),
+(N'LP-SIM-00467',N'Medium',CONVERT(datetime2,N'2026-10-19 16:13:00',120),CONVERT(datetime2,N'2026-10-23 23:13:00',120),CONVERT(datetime2,N'2026-10-23 23:13:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-23 23:13:00',120)),
+(N'LP-SIM-00468',N'Medium',CONVERT(datetime2,N'2026-10-31 13:54:00',120),CONVERT(datetime2,N'2026-11-04 13:54:00',120),CONVERT(datetime2,N'2026-11-04 13:54:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-06 13:54:00',120)),
+(N'LP-SIM-00469',N'Small',CONVERT(datetime2,N'2026-11-02 12:53:00',120),CONVERT(datetime2,N'2026-11-04 15:53:00',120),CONVERT(datetime2,N'2026-11-04 15:53:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-04 15:53:00',120)),
+(N'LP-SIM-00470',N'Small',CONVERT(datetime2,N'2026-11-13 13:09:00',120),CONVERT(datetime2,N'2026-11-15 13:09:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-15 04:09:00',120)),
+(N'LP-SIM-00471',N'Medium',CONVERT(datetime2,N'2026-10-24 23:20:00',120),CONVERT(datetime2,N'2026-10-27 07:20:00',120),CONVERT(datetime2,N'2026-10-27 07:20:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-27 07:20:00',120)),
+(N'LP-SIM-00472',N'Small',CONVERT(datetime2,N'2026-11-06 08:32:00',120),CONVERT(datetime2,N'2026-11-07 17:32:00',120),CONVERT(datetime2,N'2026-11-07 17:32:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-07 17:32:00',120)),
+(N'LP-SIM-00473',N'Medium',CONVERT(datetime2,N'2026-10-31 13:00:00',120),CONVERT(datetime2,N'2026-11-01 23:00:00',120),CONVERT(datetime2,N'2026-11-01 23:00:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-01 23:00:00',120)),
+(N'LP-SIM-00474',N'Medium',CONVERT(datetime2,N'2026-10-15 22:08:00',120),CONVERT(datetime2,N'2026-10-18 02:08:00',120),CONVERT(datetime2,N'2026-10-18 02:08:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-18 02:08:00',120)),
+(N'LP-SIM-00475',N'Small',CONVERT(datetime2,N'2026-10-15 18:59:00',120),CONVERT(datetime2,N'2026-10-16 18:59:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-16 08:59:00',120)),
+(N'LP-SIM-00476',N'Small',CONVERT(datetime2,N'2026-10-31 11:27:00',120),CONVERT(datetime2,N'2026-11-03 11:27:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-03 10:27:00',120)),
+(N'LP-SIM-00477',N'Small',CONVERT(datetime2,N'2026-10-18 17:27:00',120),CONVERT(datetime2,N'2026-10-19 17:27:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-19 07:27:00',120)),
+(N'LP-SIM-00478',N'Small',CONVERT(datetime2,N'2026-10-17 11:52:00',120),CONVERT(datetime2,N'2026-10-18 11:52:00',120),CONVERT(datetime2,N'2026-10-18 11:52:00',120),CONVERT(datetime2,N'2026-10-18 18:52:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-18 18:52:00',120)),
+(N'LP-SIM-00479',N'Large',CONVERT(datetime2,N'2026-10-29 11:50:00',120),CONVERT(datetime2,N'2026-11-02 13:50:00',120),CONVERT(datetime2,N'2026-11-02 13:50:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-02 13:50:00',120)),
+(N'LP-SIM-00480',N'Large',CONVERT(datetime2,N'2026-11-03 19:46:00',120),CONVERT(datetime2,N'2026-11-08 02:46:00',120),CONVERT(datetime2,N'2026-11-08 02:46:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-08 02:46:00',120)),
+(N'LP-SIM-00481',N'Small',CONVERT(datetime2,N'2026-10-31 21:24:00',120),CONVERT(datetime2,N'2026-11-03 21:24:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-03 10:24:00',120)),
+(N'LP-SIM-00482',N'Large',CONVERT(datetime2,N'2026-10-23 15:22:00',120),CONVERT(datetime2,N'2026-10-26 15:22:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-26 11:22:00',120)),
+(N'LP-SIM-00483',N'Large',CONVERT(datetime2,N'2026-11-01 15:17:00',120),CONVERT(datetime2,N'2026-11-05 15:17:00',120),CONVERT(datetime2,N'2026-11-05 15:17:00',120),CONVERT(datetime2,N'2026-11-07 22:17:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-07 22:17:00',120)),
+(N'LP-SIM-00484',N'Small',CONVERT(datetime2,N'2026-11-05 10:43:00',120),CONVERT(datetime2,N'2026-11-06 21:43:00',120),CONVERT(datetime2,N'2026-11-06 21:43:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-06 21:43:00',120)),
+(N'LP-SIM-00485',N'Large',CONVERT(datetime2,N'2026-10-29 21:01:00',120),CONVERT(datetime2,N'2026-10-31 01:01:00',120),CONVERT(datetime2,N'2026-10-31 01:01:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-31 01:01:00',120)),
+(N'LP-SIM-00486',N'Medium',CONVERT(datetime2,N'2026-10-27 01:58:00',120),CONVERT(datetime2,N'2026-10-29 04:58:00',120),CONVERT(datetime2,N'2026-10-29 04:58:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-29 04:58:00',120)),
+(N'LP-SIM-00487',N'Small',CONVERT(datetime2,N'2026-10-29 21:00:00',120),CONVERT(datetime2,N'2026-10-31 02:00:00',120),CONVERT(datetime2,N'2026-10-31 02:00:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-31 02:00:00',120)),
+(N'LP-SIM-00488',N'Large',CONVERT(datetime2,N'2026-10-18 21:41:00',120),CONVERT(datetime2,N'2026-10-20 21:41:00',120),CONVERT(datetime2,N'2026-10-20 21:41:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-20 21:41:00',120)),
+(N'LP-SIM-00489',N'Medium',CONVERT(datetime2,N'2026-10-26 19:30:00',120),CONVERT(datetime2,N'2026-10-27 19:30:00',120),CONVERT(datetime2,N'2026-10-27 19:30:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-27 19:30:00',120)),
+(N'LP-SIM-00490',N'Large',CONVERT(datetime2,N'2026-11-11 14:05:00',120),CONVERT(datetime2,N'2026-11-15 23:05:00',120),CONVERT(datetime2,N'2026-11-15 23:05:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-15 23:05:00',120)),
+(N'LP-SIM-00491',N'Medium',CONVERT(datetime2,N'2026-11-01 01:08:00',120),CONVERT(datetime2,N'2026-11-02 13:08:00',120),CONVERT(datetime2,N'2026-11-02 13:08:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-02 13:08:00',120)),
+(N'LP-SIM-00492',N'Medium',CONVERT(datetime2,N'2026-10-24 14:33:00',120),CONVERT(datetime2,N'2026-10-25 14:33:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-25 03:33:00',120)),
+(N'LP-SIM-00493',N'Small',CONVERT(datetime2,N'2026-10-27 00:03:00',120),CONVERT(datetime2,N'2026-10-30 05:03:00',120),CONVERT(datetime2,N'2026-10-30 05:03:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-30 05:03:00',120)),
+(N'LP-SIM-00494',N'Medium',CONVERT(datetime2,N'2026-11-08 06:29:00',120),CONVERT(datetime2,N'2026-11-10 06:29:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-09 23:29:00',120)),
+(N'LP-SIM-00495',N'Small',CONVERT(datetime2,N'2026-11-05 05:23:00',120),CONVERT(datetime2,N'2026-11-09 05:23:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-08 18:23:00',120)),
+(N'LP-SIM-00496',N'Medium',CONVERT(datetime2,N'2026-10-26 23:46:00',120),CONVERT(datetime2,N'2026-10-29 23:46:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 15:46:00',120)),
+(N'LP-SIM-00497',N'Medium',CONVERT(datetime2,N'2026-11-10 03:07:00',120),CONVERT(datetime2,N'2026-11-14 03:07:00',120),CONVERT(datetime2,N'2026-11-14 03:07:00',120),CONVERT(datetime2,N'2026-11-14 13:07:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-14 13:07:00',120)),
+(N'LP-SIM-00498',N'Small',CONVERT(datetime2,N'2026-10-30 09:32:00',120),CONVERT(datetime2,N'2026-10-31 15:32:00',120),CONVERT(datetime2,N'2026-10-31 15:32:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-31 15:32:00',120)),
+(N'LP-SIM-00499',N'Medium',CONVERT(datetime2,N'2026-10-18 10:32:00',120),CONVERT(datetime2,N'2026-10-20 14:32:00',120),CONVERT(datetime2,N'2026-10-20 14:32:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-20 14:32:00',120)),
+(N'LP-SIM-00500',N'Small',CONVERT(datetime2,N'2026-10-20 21:19:00',120),CONVERT(datetime2,N'2026-10-25 02:19:00',120),CONVERT(datetime2,N'2026-10-25 02:19:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-25 02:19:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00501',N'Medium',CONVERT(datetime2,N'2026-11-08 18:37:00',120),CONVERT(datetime2,N'2026-11-09 18:37:00',120),CONVERT(datetime2,N'2026-11-09 18:37:00',120),CONVERT(datetime2,N'2026-11-10 17:37:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-10 17:37:00',120)),
+(N'LP-SIM-00502',N'Medium',CONVERT(datetime2,N'2026-10-19 05:43:00',120),CONVERT(datetime2,N'2026-10-20 17:43:00',120),CONVERT(datetime2,N'2026-10-20 17:43:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-20 17:43:00',120)),
+(N'LP-SIM-00503',N'Small',CONVERT(datetime2,N'2026-10-25 05:45:00',120),CONVERT(datetime2,N'2026-10-28 17:45:00',120),CONVERT(datetime2,N'2026-10-28 17:45:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-28 17:45:00',120)),
+(N'LP-SIM-00504',N'Large',CONVERT(datetime2,N'2026-10-26 20:03:00',120),CONVERT(datetime2,N'2026-10-30 20:03:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-30 09:03:00',120)),
+(N'LP-SIM-00505',N'Medium',CONVERT(datetime2,N'2026-11-01 13:46:00',120),CONVERT(datetime2,N'2026-11-06 00:46:00',120),CONVERT(datetime2,N'2026-11-06 00:46:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-06 00:46:00',120)),
+(N'LP-SIM-00506',N'Small',CONVERT(datetime2,N'2026-11-12 09:16:00',120),CONVERT(datetime2,N'2026-11-15 12:16:00',120),CONVERT(datetime2,N'2026-11-15 12:16:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-15 12:16:00',120)),
+(N'LP-SIM-00507',N'Medium',CONVERT(datetime2,N'2026-11-05 03:10:00',120),CONVERT(datetime2,N'2026-11-07 03:10:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-06 17:10:00',120)),
+(N'LP-SIM-00508',N'Large',CONVERT(datetime2,N'2026-11-03 12:26:00',120),CONVERT(datetime2,N'2026-11-06 15:26:00',120),CONVERT(datetime2,N'2026-11-06 15:26:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-06 15:26:00',120)),
+(N'LP-SIM-00509',N'Small',CONVERT(datetime2,N'2026-10-15 19:31:00',120),CONVERT(datetime2,N'2026-10-18 19:31:00',120),CONVERT(datetime2,N'2026-10-18 19:31:00',120),CONVERT(datetime2,N'2026-10-21 07:31:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-21 07:31:00',120)),
+(N'LP-SIM-00510',N'Large',CONVERT(datetime2,N'2026-11-12 10:36:00',120),CONVERT(datetime2,N'2026-11-16 10:36:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-16 01:36:00',120)),
+(N'LP-SIM-00511',N'Small',CONVERT(datetime2,N'2026-10-28 20:10:00',120),CONVERT(datetime2,N'2026-10-30 21:10:00',120),CONVERT(datetime2,N'2026-10-30 21:10:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-30 21:10:00',120)),
+(N'LP-SIM-00512',N'Medium',CONVERT(datetime2,N'2026-10-28 14:54:00',120),CONVERT(datetime2,N'2026-10-31 20:54:00',120),CONVERT(datetime2,N'2026-10-31 20:54:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-31 20:54:00',120)),
+(N'LP-SIM-00513',N'Small',CONVERT(datetime2,N'2026-10-21 05:40:00',120),CONVERT(datetime2,N'2026-10-22 05:40:00',120),CONVERT(datetime2,N'2026-10-22 05:40:00',120),CONVERT(datetime2,N'2026-10-22 20:40:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-22 20:40:00',120)),
+(N'LP-SIM-00514',N'Small',CONVERT(datetime2,N'2026-10-16 04:16:00',120),CONVERT(datetime2,N'2026-10-19 04:16:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-18 19:16:00',120)),
+(N'LP-SIM-00515',N'Medium',CONVERT(datetime2,N'2026-11-12 05:46:00',120),CONVERT(datetime2,N'2026-11-16 12:46:00',120),CONVERT(datetime2,N'2026-11-16 12:46:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-16 12:46:00',120)),
+(N'LP-SIM-00516',N'Large',CONVERT(datetime2,N'2026-10-31 11:26:00',120),CONVERT(datetime2,N'2026-11-01 16:26:00',120),CONVERT(datetime2,N'2026-11-01 16:26:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-01 16:26:00',120)),
+(N'LP-SIM-00517',N'Medium',CONVERT(datetime2,N'2026-10-15 19:10:00',120),CONVERT(datetime2,N'2026-10-16 19:10:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-16 08:10:00',120)),
+(N'LP-SIM-00518',N'Medium',CONVERT(datetime2,N'2026-11-09 18:43:00',120),CONVERT(datetime2,N'2026-11-10 18:43:00',120),CONVERT(datetime2,N'2026-11-10 18:43:00',120),CONVERT(datetime2,N'2026-11-12 10:43:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-12 10:43:00',120)),
+(N'LP-SIM-00519',N'Medium',CONVERT(datetime2,N'2026-10-21 21:47:00',120),CONVERT(datetime2,N'2026-10-25 21:47:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-25 09:47:00',120)),
+(N'LP-SIM-00520',N'Medium',CONVERT(datetime2,N'2026-10-28 07:20:00',120),CONVERT(datetime2,N'2026-10-29 19:20:00',120),CONVERT(datetime2,N'2026-10-29 19:20:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-29 19:20:00',120)),
+(N'LP-SIM-00521',N'Large',CONVERT(datetime2,N'2026-10-26 01:56:00',120),CONVERT(datetime2,N'2026-10-27 02:56:00',120),CONVERT(datetime2,N'2026-10-27 02:56:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-27 02:56:00',120)),
+(N'LP-SIM-00522',N'Medium',CONVERT(datetime2,N'2026-11-03 15:22:00',120),CONVERT(datetime2,N'2026-11-05 15:22:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-05 14:22:00',120)),
+(N'LP-SIM-00523',N'Small',CONVERT(datetime2,N'2026-10-25 06:41:00',120),CONVERT(datetime2,N'2026-10-27 15:41:00',120),CONVERT(datetime2,N'2026-10-27 15:41:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-27 15:41:00',120)),
+(N'LP-SIM-00524',N'Small',CONVERT(datetime2,N'2026-10-22 13:50:00',120),CONVERT(datetime2,N'2026-10-25 13:50:00',120),CONVERT(datetime2,N'2026-10-25 13:50:00',120),CONVERT(datetime2,N'2026-10-26 23:50:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-26 23:50:00',120)),
+(N'LP-SIM-00525',N'Large',CONVERT(datetime2,N'2026-11-01 05:27:00',120),CONVERT(datetime2,N'2026-11-04 15:27:00',120),CONVERT(datetime2,N'2026-11-04 15:27:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-04 15:27:00',120)),
+(N'LP-SIM-00526',N'Small',CONVERT(datetime2,N'2026-11-13 05:02:00',120),CONVERT(datetime2,N'2026-11-17 05:02:00',120),CONVERT(datetime2,N'2026-11-17 05:02:00',120),NULL,N'Returned',NULL,4,CONVERT(datetime2,N'2026-11-22 05:02:00',120)),
+(N'LP-SIM-00527',N'Small',CONVERT(datetime2,N'2026-11-02 02:27:00',120),CONVERT(datetime2,N'2026-11-04 02:27:00',120),CONVERT(datetime2,N'2026-11-04 02:27:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-04 02:27:00',120)),
+(N'LP-SIM-00528',N'Medium',CONVERT(datetime2,N'2026-10-16 00:42:00',120),CONVERT(datetime2,N'2026-10-20 03:42:00',120),CONVERT(datetime2,N'2026-10-20 03:42:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-20 03:42:00',120)),
+(N'LP-SIM-00529',N'Small',CONVERT(datetime2,N'2026-11-07 18:14:00',120),CONVERT(datetime2,N'2026-11-11 18:14:00',120),CONVERT(datetime2,N'2026-11-11 18:14:00',120),CONVERT(datetime2,N'2026-11-14 06:14:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-14 06:14:00',120)),
+(N'LP-SIM-00530',N'Small',CONVERT(datetime2,N'2026-11-11 03:55:00',120),CONVERT(datetime2,N'2026-11-15 03:55:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-14 15:55:00',120)),
+(N'LP-SIM-00531',N'Small',CONVERT(datetime2,N'2026-10-31 07:22:00',120),CONVERT(datetime2,N'2026-11-04 07:22:00',120),CONVERT(datetime2,N'2026-11-04 07:22:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-08 07:22:00',120)),
+(N'LP-SIM-00532',N'Large',CONVERT(datetime2,N'2026-10-27 21:06:00',120),CONVERT(datetime2,N'2026-10-30 23:06:00',120),CONVERT(datetime2,N'2026-10-30 23:06:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-30 23:06:00',120)),
+(N'LP-SIM-00533',N'Large',CONVERT(datetime2,N'2026-11-08 18:22:00',120),CONVERT(datetime2,N'2026-11-10 19:22:00',120),CONVERT(datetime2,N'2026-11-10 19:22:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-10 19:22:00',120)),
+(N'LP-SIM-00534',N'Small',CONVERT(datetime2,N'2026-10-29 21:06:00',120),CONVERT(datetime2,N'2026-10-31 06:06:00',120),CONVERT(datetime2,N'2026-10-31 06:06:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-31 06:06:00',120)),
+(N'LP-SIM-00535',N'Medium',CONVERT(datetime2,N'2026-10-31 17:48:00',120),CONVERT(datetime2,N'2026-11-02 17:48:00',120),CONVERT(datetime2,N'2026-11-02 17:48:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-02 17:48:00',120)),
+(N'LP-SIM-00536',N'Medium',CONVERT(datetime2,N'2026-10-22 04:23:00',120),CONVERT(datetime2,N'2026-10-23 04:23:00',120),CONVERT(datetime2,N'2026-10-23 04:23:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-10-27 04:23:00',120)),
+(N'LP-SIM-00537',N'Medium',CONVERT(datetime2,N'2026-10-22 04:53:00',120),CONVERT(datetime2,N'2026-10-24 04:53:00',120),CONVERT(datetime2,N'2026-10-24 04:53:00',120),CONVERT(datetime2,N'2026-10-24 16:53:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-24 16:53:00',120)),
+(N'LP-SIM-00538',N'Medium',CONVERT(datetime2,N'2026-10-31 04:06:00',120),CONVERT(datetime2,N'2026-11-04 14:06:00',120),CONVERT(datetime2,N'2026-11-04 14:06:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-04 14:06:00',120)),
+(N'LP-SIM-00539',N'Small',CONVERT(datetime2,N'2026-11-01 06:17:00',120),CONVERT(datetime2,N'2026-11-04 13:17:00',120),CONVERT(datetime2,N'2026-11-04 13:17:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-04 13:17:00',120)),
+(N'LP-SIM-00540',N'Medium',CONVERT(datetime2,N'2026-11-10 00:03:00',120),CONVERT(datetime2,N'2026-11-11 00:03:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 14:03:00',120)),
+(N'LP-SIM-00541',N'Large',CONVERT(datetime2,N'2026-10-17 11:28:00',120),CONVERT(datetime2,N'2026-10-19 20:28:00',120),CONVERT(datetime2,N'2026-10-19 20:28:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-19 20:28:00',120)),
+(N'LP-SIM-00542',N'Small',CONVERT(datetime2,N'2026-11-03 00:29:00',120),CONVERT(datetime2,N'2026-11-06 07:29:00',120),CONVERT(datetime2,N'2026-11-06 07:29:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-11-06 07:29:00',120)),
+(N'LP-SIM-00543',N'Large',CONVERT(datetime2,N'2026-11-11 21:33:00',120),CONVERT(datetime2,N'2026-11-14 01:33:00',120),CONVERT(datetime2,N'2026-11-14 01:33:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-11-14 01:33:00',120)),
+(N'LP-SIM-00544',N'Large',CONVERT(datetime2,N'2026-10-16 04:42:00',120),CONVERT(datetime2,N'2026-10-20 04:42:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-20 02:42:00',120)),
+(N'LP-SIM-00545',N'Medium',CONVERT(datetime2,N'2026-11-11 13:46:00',120),CONVERT(datetime2,N'2026-11-12 13:46:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-12 03:46:00',120)),
+(N'LP-SIM-00546',N'Medium',CONVERT(datetime2,N'2026-11-12 03:27:00',120),CONVERT(datetime2,N'2026-11-15 07:27:00',120),CONVERT(datetime2,N'2026-11-15 07:27:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-15 07:27:00',120)),
+(N'LP-SIM-00547',N'Medium',CONVERT(datetime2,N'2026-11-06 17:12:00',120),CONVERT(datetime2,N'2026-11-07 17:12:00',120),CONVERT(datetime2,N'2026-11-07 17:12:00',120),CONVERT(datetime2,N'2026-11-08 20:12:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-08 20:12:00',120)),
+(N'LP-SIM-00548',N'Large',CONVERT(datetime2,N'2026-11-12 04:56:00',120),CONVERT(datetime2,N'2026-11-13 09:56:00',120),CONVERT(datetime2,N'2026-11-13 09:56:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-13 09:56:00',120)),
+(N'LP-SIM-00549',N'Small',CONVERT(datetime2,N'2026-10-27 04:22:00',120),CONVERT(datetime2,N'2026-10-29 04:22:00',120),CONVERT(datetime2,N'2026-10-29 04:22:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-29 04:22:00',120)),
+(N'LP-SIM-00550',N'Medium',CONVERT(datetime2,N'2026-10-23 16:05:00',120),CONVERT(datetime2,N'2026-10-25 16:05:00',120),CONVERT(datetime2,N'2026-10-25 16:05:00',120),CONVERT(datetime2,N'2026-10-27 10:05:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-27 10:05:00',120)),
+(N'LP-SIM-00551',N'Medium',CONVERT(datetime2,N'2026-11-03 05:23:00',120),CONVERT(datetime2,N'2026-11-04 05:23:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-03 20:23:00',120)),
+(N'LP-SIM-00552',N'Medium',CONVERT(datetime2,N'2026-11-05 02:15:00',120),CONVERT(datetime2,N'2026-11-09 08:15:00',120),CONVERT(datetime2,N'2026-11-09 08:15:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-09 08:15:00',120)),
+(N'LP-SIM-00553',N'Small',CONVERT(datetime2,N'2026-10-24 20:57:00',120),CONVERT(datetime2,N'2026-10-26 20:57:00',120),CONVERT(datetime2,N'2026-10-26 20:57:00',120),CONVERT(datetime2,N'2026-10-27 12:57:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-27 12:57:00',120)),
+(N'LP-SIM-00554',N'Small',CONVERT(datetime2,N'2026-10-29 23:00:00',120),CONVERT(datetime2,N'2026-11-02 11:00:00',120),CONVERT(datetime2,N'2026-11-02 11:00:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-02 11:00:00',120)),
+(N'LP-SIM-00555',N'Medium',CONVERT(datetime2,N'2026-11-06 01:06:00',120),CONVERT(datetime2,N'2026-11-08 01:06:00',120),CONVERT(datetime2,N'2026-11-08 01:06:00',120),CONVERT(datetime2,N'2026-11-10 10:06:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-10 10:06:00',120)),
+(N'LP-SIM-00556',N'Small',CONVERT(datetime2,N'2026-11-11 22:35:00',120),CONVERT(datetime2,N'2026-11-15 09:35:00',120),CONVERT(datetime2,N'2026-11-15 09:35:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-15 09:35:00',120)),
+(N'LP-SIM-00557',N'Small',CONVERT(datetime2,N'2026-10-26 06:26:00',120),CONVERT(datetime2,N'2026-10-28 06:26:00',120),CONVERT(datetime2,N'2026-10-28 06:26:00',120),CONVERT(datetime2,N'2026-10-30 13:26:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-30 13:26:00',120)),
+(N'LP-SIM-00558',N'Large',CONVERT(datetime2,N'2026-10-19 16:25:00',120),CONVERT(datetime2,N'2026-10-22 16:25:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-22 12:25:00',120)),
+(N'LP-SIM-00559',N'Medium',CONVERT(datetime2,N'2026-10-29 06:25:00',120),CONVERT(datetime2,N'2026-10-31 06:25:00',120),CONVERT(datetime2,N'2026-10-31 06:25:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-06 06:25:00',120)),
+(N'LP-SIM-00560',N'Medium',CONVERT(datetime2,N'2026-10-20 23:27:00',120),CONVERT(datetime2,N'2026-10-23 07:27:00',120),CONVERT(datetime2,N'2026-10-23 07:27:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-23 07:27:00',120)),
+(N'LP-SIM-00561',N'Small',CONVERT(datetime2,N'2026-11-02 21:24:00',120),CONVERT(datetime2,N'2026-11-04 21:24:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-04 11:24:00',120)),
+(N'LP-SIM-00562',N'Large',CONVERT(datetime2,N'2026-10-26 04:17:00',120),CONVERT(datetime2,N'2026-10-28 13:17:00',120),CONVERT(datetime2,N'2026-10-28 13:17:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-28 13:17:00',120)),
+(N'LP-SIM-00563',N'Small',CONVERT(datetime2,N'2026-11-10 02:45:00',120),CONVERT(datetime2,N'2026-11-14 02:45:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-13 21:45:00',120)),
+(N'LP-SIM-00564',N'Medium',CONVERT(datetime2,N'2026-10-26 22:48:00',120),CONVERT(datetime2,N'2026-10-30 22:48:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-30 10:48:00',120)),
+(N'LP-SIM-00565',N'Small',CONVERT(datetime2,N'2026-11-03 17:56:00',120),CONVERT(datetime2,N'2026-11-07 18:56:00',120),CONVERT(datetime2,N'2026-11-07 18:56:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-07 18:56:00',120)),
+(N'LP-SIM-00566',N'Large',CONVERT(datetime2,N'2026-10-27 16:47:00',120),CONVERT(datetime2,N'2026-10-29 16:47:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 07:47:00',120)),
+(N'LP-SIM-00567',N'Small',CONVERT(datetime2,N'2026-11-05 05:48:00',120),CONVERT(datetime2,N'2026-11-07 09:48:00',120),CONVERT(datetime2,N'2026-11-07 09:48:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-07 09:48:00',120)),
+(N'LP-SIM-00568',N'Large',CONVERT(datetime2,N'2026-11-08 05:15:00',120),CONVERT(datetime2,N'2026-11-12 12:15:00',120),CONVERT(datetime2,N'2026-11-12 12:15:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-12 12:15:00',120)),
+(N'LP-SIM-00569',N'Small',CONVERT(datetime2,N'2026-10-24 14:41:00',120),CONVERT(datetime2,N'2026-10-28 14:41:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-28 09:41:00',120)),
+(N'LP-SIM-00570',N'Large',CONVERT(datetime2,N'2026-11-09 01:34:00',120),CONVERT(datetime2,N'2026-11-13 12:34:00',120),CONVERT(datetime2,N'2026-11-13 12:34:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-13 12:34:00',120)),
+(N'LP-SIM-00571',N'Medium',CONVERT(datetime2,N'2026-11-05 23:23:00',120),CONVERT(datetime2,N'2026-11-10 01:23:00',120),CONVERT(datetime2,N'2026-11-10 01:23:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-10 01:23:00',120)),
+(N'LP-SIM-00572',N'Small',CONVERT(datetime2,N'2026-10-16 20:23:00',120),CONVERT(datetime2,N'2026-10-19 20:23:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-19 09:23:00',120)),
+(N'LP-SIM-00573',N'Medium',CONVERT(datetime2,N'2026-10-28 14:30:00',120),CONVERT(datetime2,N'2026-10-29 20:30:00',120),CONVERT(datetime2,N'2026-10-29 20:30:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-29 20:30:00',120)),
+(N'LP-SIM-00574',N'Small',CONVERT(datetime2,N'2026-10-31 11:01:00',120),CONVERT(datetime2,N'2026-11-03 19:01:00',120),CONVERT(datetime2,N'2026-11-03 19:01:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-03 19:01:00',120)),
+(N'LP-SIM-00575',N'Medium',CONVERT(datetime2,N'2026-10-18 09:05:00',120),CONVERT(datetime2,N'2026-10-22 14:05:00',120),CONVERT(datetime2,N'2026-10-22 14:05:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-22 14:05:00',120)),
+(N'LP-SIM-00576',N'Medium',CONVERT(datetime2,N'2026-10-20 10:11:00',120),CONVERT(datetime2,N'2026-10-21 20:11:00',120),CONVERT(datetime2,N'2026-10-21 20:11:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-21 20:11:00',120)),
+(N'LP-SIM-00577',N'Medium',CONVERT(datetime2,N'2026-10-18 03:05:00',120),CONVERT(datetime2,N'2026-10-19 03:05:00',120),CONVERT(datetime2,N'2026-10-19 03:05:00',120),CONVERT(datetime2,N'2026-10-21 11:05:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-21 11:05:00',120)),
+(N'LP-SIM-00578',N'Large',CONVERT(datetime2,N'2026-10-24 02:58:00',120),CONVERT(datetime2,N'2026-10-27 02:58:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-26 14:58:00',120)),
+(N'LP-SIM-00579',N'Medium',CONVERT(datetime2,N'2026-11-06 11:24:00',120),CONVERT(datetime2,N'2026-11-10 15:24:00',120),CONVERT(datetime2,N'2026-11-10 15:24:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-10 15:24:00',120)),
+(N'LP-SIM-00580',N'Small',CONVERT(datetime2,N'2026-10-21 06:06:00',120),CONVERT(datetime2,N'2026-10-24 18:06:00',120),CONVERT(datetime2,N'2026-10-24 18:06:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-10-24 18:06:00',120)),
+(N'LP-SIM-00581',N'Small',CONVERT(datetime2,N'2026-11-10 11:24:00',120),CONVERT(datetime2,N'2026-11-13 11:24:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-13 03:24:00',120)),
+(N'LP-SIM-00582',N'Medium',CONVERT(datetime2,N'2026-11-09 17:11:00',120),CONVERT(datetime2,N'2026-11-11 17:11:00',120),CONVERT(datetime2,N'2026-11-11 17:11:00',120),CONVERT(datetime2,N'2026-11-13 20:11:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-13 20:11:00',120)),
+(N'LP-SIM-00583',N'Large',CONVERT(datetime2,N'2026-11-08 07:06:00',120),CONVERT(datetime2,N'2026-11-09 07:06:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-08 21:06:00',120)),
+(N'LP-SIM-00584',N'Small',CONVERT(datetime2,N'2026-11-12 16:51:00',120),CONVERT(datetime2,N'2026-11-15 16:51:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-15 06:51:00',120)),
+(N'LP-SIM-00585',N'Small',CONVERT(datetime2,N'2026-11-14 03:36:00',120),CONVERT(datetime2,N'2026-11-17 03:36:00',120),CONVERT(datetime2,N'2026-11-17 03:36:00',120),CONVERT(datetime2,N'2026-11-19 22:36:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-19 22:36:00',120)),
+(N'LP-SIM-00586',N'Medium',CONVERT(datetime2,N'2026-10-20 03:15:00',120),CONVERT(datetime2,N'2026-10-24 03:15:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-23 20:15:00',120)),
+(N'LP-SIM-00587',N'Small',CONVERT(datetime2,N'2026-10-21 07:29:00',120),CONVERT(datetime2,N'2026-10-23 18:29:00',120),CONVERT(datetime2,N'2026-10-23 18:29:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-23 18:29:00',120)),
+(N'LP-SIM-00588',N'Medium',CONVERT(datetime2,N'2026-10-20 22:30:00',120),CONVERT(datetime2,N'2026-10-23 09:30:00',120),CONVERT(datetime2,N'2026-10-23 09:30:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-23 09:30:00',120)),
+(N'LP-SIM-00589',N'Small',CONVERT(datetime2,N'2026-10-23 23:34:00',120),CONVERT(datetime2,N'2026-10-28 09:34:00',120),CONVERT(datetime2,N'2026-10-28 09:34:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-28 09:34:00',120)),
+(N'LP-SIM-00590',N'Medium',CONVERT(datetime2,N'2026-10-26 10:50:00',120),CONVERT(datetime2,N'2026-10-27 14:50:00',120),CONVERT(datetime2,N'2026-10-27 14:50:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-10-27 14:50:00',120)),
+(N'LP-SIM-00591',N'Large',CONVERT(datetime2,N'2026-10-24 20:21:00',120),CONVERT(datetime2,N'2026-10-28 04:21:00',120),CONVERT(datetime2,N'2026-10-28 04:21:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-28 04:21:00',120)),
+(N'LP-SIM-00592',N'Small',CONVERT(datetime2,N'2026-11-09 10:05:00',120),CONVERT(datetime2,N'2026-11-10 10:05:00',120),CONVERT(datetime2,N'2026-11-10 10:05:00',120),CONVERT(datetime2,N'2026-11-13 01:05:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-13 01:05:00',120)),
+(N'LP-SIM-00593',N'Medium',CONVERT(datetime2,N'2026-11-06 21:14:00',120),CONVERT(datetime2,N'2026-11-09 06:14:00',120),CONVERT(datetime2,N'2026-11-09 06:14:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-09 06:14:00',120)),
+(N'LP-SIM-00594',N'Small',CONVERT(datetime2,N'2026-10-30 11:02:00',120),CONVERT(datetime2,N'2026-11-01 23:02:00',120),CONVERT(datetime2,N'2026-11-01 23:02:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-01 23:02:00',120)),
+(N'LP-SIM-00595',N'Medium',CONVERT(datetime2,N'2026-11-09 14:32:00',120),CONVERT(datetime2,N'2026-11-11 00:32:00',120),CONVERT(datetime2,N'2026-11-11 00:32:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-11 00:32:00',120)),
+(N'LP-SIM-00596',N'Medium',CONVERT(datetime2,N'2026-10-28 22:34:00',120),CONVERT(datetime2,N'2026-10-30 05:34:00',120),CONVERT(datetime2,N'2026-10-30 05:34:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-30 05:34:00',120)),
+(N'LP-SIM-00597',N'Small',CONVERT(datetime2,N'2026-11-01 20:18:00',120),CONVERT(datetime2,N'2026-11-05 22:18:00',120),CONVERT(datetime2,N'2026-11-05 22:18:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-05 22:18:00',120)),
+(N'LP-SIM-00598',N'Small',CONVERT(datetime2,N'2026-11-02 03:46:00',120),CONVERT(datetime2,N'2026-11-05 06:46:00',120),CONVERT(datetime2,N'2026-11-05 06:46:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-05 06:46:00',120)),
+(N'LP-SIM-00599',N'Small',CONVERT(datetime2,N'2026-10-21 23:43:00',120),CONVERT(datetime2,N'2026-10-25 23:43:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-25 16:43:00',120)),
+(N'LP-SIM-00600',N'Medium',CONVERT(datetime2,N'2026-11-12 05:15:00',120),CONVERT(datetime2,N'2026-11-13 10:15:00',120),CONVERT(datetime2,N'2026-11-13 10:15:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-13 10:15:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00601',N'Small',CONVERT(datetime2,N'2026-11-10 04:34:00',120),CONVERT(datetime2,N'2026-11-12 04:34:00',120),CONVERT(datetime2,N'2026-11-12 04:34:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-17 04:34:00',120)),
+(N'LP-SIM-00602',N'Small',CONVERT(datetime2,N'2026-10-21 23:14:00',120),CONVERT(datetime2,N'2026-10-24 06:14:00',120),CONVERT(datetime2,N'2026-10-24 06:14:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-10-24 06:14:00',120)),
+(N'LP-SIM-00603',N'Medium',CONVERT(datetime2,N'2026-11-05 15:39:00',120),CONVERT(datetime2,N'2026-11-06 16:39:00',120),CONVERT(datetime2,N'2026-11-06 16:39:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-06 16:39:00',120)),
+(N'LP-SIM-00604',N'Large',CONVERT(datetime2,N'2026-10-23 18:35:00',120),CONVERT(datetime2,N'2026-10-27 18:35:00',120),CONVERT(datetime2,N'2026-10-27 18:35:00',120),CONVERT(datetime2,N'2026-10-28 20:35:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-28 20:35:00',120)),
+(N'LP-SIM-00605',N'Large',CONVERT(datetime2,N'2026-11-13 00:52:00',120),CONVERT(datetime2,N'2026-11-15 00:52:00',120),CONVERT(datetime2,N'2026-11-15 00:52:00',120),CONVERT(datetime2,N'2026-11-17 03:52:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-17 03:52:00',120)),
+(N'LP-SIM-00606',N'Medium',CONVERT(datetime2,N'2026-10-22 21:15:00',120),CONVERT(datetime2,N'2026-10-27 00:15:00',120),CONVERT(datetime2,N'2026-10-27 00:15:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-27 00:15:00',120)),
+(N'LP-SIM-00607',N'Large',CONVERT(datetime2,N'2026-11-07 06:31:00',120),CONVERT(datetime2,N'2026-11-08 06:31:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-08 03:31:00',120)),
+(N'LP-SIM-00608',N'Large',CONVERT(datetime2,N'2026-11-04 21:07:00',120),CONVERT(datetime2,N'2026-11-09 02:07:00',120),CONVERT(datetime2,N'2026-11-09 02:07:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-11-09 02:07:00',120)),
+(N'LP-SIM-00609',N'Large',CONVERT(datetime2,N'2026-11-06 20:44:00',120),CONVERT(datetime2,N'2026-11-10 20:44:00',120),CONVERT(datetime2,N'2026-11-10 20:44:00',120),CONVERT(datetime2,N'2026-11-13 12:44:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-13 12:44:00',120)),
+(N'LP-SIM-00610',N'Small',CONVERT(datetime2,N'2026-10-30 21:20:00',120),CONVERT(datetime2,N'2026-11-03 07:20:00',120),CONVERT(datetime2,N'2026-11-03 07:20:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-03 07:20:00',120)),
+(N'LP-SIM-00611',N'Small',CONVERT(datetime2,N'2026-11-12 22:11:00',120),CONVERT(datetime2,N'2026-11-16 01:11:00',120),CONVERT(datetime2,N'2026-11-16 01:11:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-16 01:11:00',120)),
+(N'LP-SIM-00612',N'Small',CONVERT(datetime2,N'2026-10-16 21:22:00',120),CONVERT(datetime2,N'2026-10-17 21:22:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-17 16:22:00',120)),
+(N'LP-SIM-00613',N'Large',CONVERT(datetime2,N'2026-11-14 05:44:00',120),CONVERT(datetime2,N'2026-11-17 15:44:00',120),CONVERT(datetime2,N'2026-11-17 15:44:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-17 15:44:00',120)),
+(N'LP-SIM-00614',N'Medium',CONVERT(datetime2,N'2026-11-07 11:50:00',120),CONVERT(datetime2,N'2026-11-10 11:50:00',120),CONVERT(datetime2,N'2026-11-10 11:50:00',120),CONVERT(datetime2,N'2026-11-11 12:50:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-11 12:50:00',120)),
+(N'LP-SIM-00615',N'Large',CONVERT(datetime2,N'2026-10-20 22:00:00',120),CONVERT(datetime2,N'2026-10-22 01:00:00',120),CONVERT(datetime2,N'2026-10-22 01:00:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-22 01:00:00',120)),
+(N'LP-SIM-00616',N'Small',CONVERT(datetime2,N'2026-11-11 23:11:00',120),CONVERT(datetime2,N'2026-11-15 04:11:00',120),CONVERT(datetime2,N'2026-11-15 04:11:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-15 04:11:00',120)),
+(N'LP-SIM-00617',N'Medium',CONVERT(datetime2,N'2026-11-05 18:27:00',120),CONVERT(datetime2,N'2026-11-08 19:27:00',120),CONVERT(datetime2,N'2026-11-08 19:27:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-11-08 19:27:00',120)),
+(N'LP-SIM-00618',N'Large',CONVERT(datetime2,N'2026-10-16 18:56:00',120),CONVERT(datetime2,N'2026-10-19 22:56:00',120),CONVERT(datetime2,N'2026-10-19 22:56:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-19 22:56:00',120)),
+(N'LP-SIM-00619',N'Medium',CONVERT(datetime2,N'2026-10-27 13:46:00',120),CONVERT(datetime2,N'2026-10-31 13:46:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-31 01:46:00',120)),
+(N'LP-SIM-00620',N'Medium',CONVERT(datetime2,N'2026-11-01 15:53:00',120),CONVERT(datetime2,N'2026-11-04 15:53:00',120),CONVERT(datetime2,N'2026-11-04 15:53:00',120),CONVERT(datetime2,N'2026-11-06 07:53:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-06 07:53:00',120)),
+(N'LP-SIM-00621',N'Small',CONVERT(datetime2,N'2026-10-20 12:08:00',120),CONVERT(datetime2,N'2026-10-24 12:08:00',120),CONVERT(datetime2,N'2026-10-24 12:08:00',120),CONVERT(datetime2,N'2026-10-26 05:08:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-26 05:08:00',120)),
+(N'LP-SIM-00622',N'Small',CONVERT(datetime2,N'2026-10-29 00:50:00',120),CONVERT(datetime2,N'2026-10-30 05:50:00',120),CONVERT(datetime2,N'2026-10-30 05:50:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-30 05:50:00',120)),
+(N'LP-SIM-00623',N'Small',CONVERT(datetime2,N'2026-11-09 19:52:00',120),CONVERT(datetime2,N'2026-11-10 19:52:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-10 15:52:00',120)),
+(N'LP-SIM-00624',N'Small',CONVERT(datetime2,N'2026-10-31 13:42:00',120),CONVERT(datetime2,N'2026-11-01 15:42:00',120),CONVERT(datetime2,N'2026-11-01 15:42:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-01 15:42:00',120)),
+(N'LP-SIM-00625',N'Small',CONVERT(datetime2,N'2026-10-15 16:52:00',120),CONVERT(datetime2,N'2026-10-19 04:52:00',120),CONVERT(datetime2,N'2026-10-19 04:52:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-19 04:52:00',120)),
+(N'LP-SIM-00626',N'Large',CONVERT(datetime2,N'2026-11-04 20:39:00',120),CONVERT(datetime2,N'2026-11-07 04:39:00',120),CONVERT(datetime2,N'2026-11-07 04:39:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-07 04:39:00',120)),
+(N'LP-SIM-00627',N'Small',CONVERT(datetime2,N'2026-11-13 13:53:00',120),CONVERT(datetime2,N'2026-11-16 21:53:00',120),CONVERT(datetime2,N'2026-11-16 21:53:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-16 21:53:00',120)),
+(N'LP-SIM-00628',N'Small',CONVERT(datetime2,N'2026-10-24 03:02:00',120),CONVERT(datetime2,N'2026-10-27 03:02:00',120),CONVERT(datetime2,N'2026-10-27 03:02:00',120),CONVERT(datetime2,N'2026-10-27 09:02:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-27 09:02:00',120)),
+(N'LP-SIM-00629',N'Medium',CONVERT(datetime2,N'2026-10-31 03:41:00',120),CONVERT(datetime2,N'2026-11-04 03:41:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-03 22:41:00',120)),
+(N'LP-SIM-00630',N'Large',CONVERT(datetime2,N'2026-10-20 08:57:00',120),CONVERT(datetime2,N'2026-10-23 12:57:00',120),CONVERT(datetime2,N'2026-10-23 12:57:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-23 12:57:00',120)),
+(N'LP-SIM-00631',N'Large',CONVERT(datetime2,N'2026-10-22 18:35:00',120),CONVERT(datetime2,N'2026-10-23 21:35:00',120),CONVERT(datetime2,N'2026-10-23 21:35:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-23 21:35:00',120)),
+(N'LP-SIM-00632',N'Large',CONVERT(datetime2,N'2026-11-03 06:55:00',120),CONVERT(datetime2,N'2026-11-06 14:55:00',120),CONVERT(datetime2,N'2026-11-06 14:55:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-06 14:55:00',120)),
+(N'LP-SIM-00633',N'Medium',CONVERT(datetime2,N'2026-11-12 12:12:00',120),CONVERT(datetime2,N'2026-11-16 12:12:00',120),CONVERT(datetime2,N'2026-11-16 12:12:00',120),NULL,N'Returned',NULL,4,CONVERT(datetime2,N'2026-11-19 12:12:00',120)),
+(N'LP-SIM-00634',N'Small',CONVERT(datetime2,N'2026-11-12 20:13:00',120),CONVERT(datetime2,N'2026-11-16 20:13:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-16 09:13:00',120)),
+(N'LP-SIM-00635',N'Large',CONVERT(datetime2,N'2026-10-21 01:25:00',120),CONVERT(datetime2,N'2026-10-22 06:25:00',120),CONVERT(datetime2,N'2026-10-22 06:25:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-22 06:25:00',120)),
+(N'LP-SIM-00636',N'Medium',CONVERT(datetime2,N'2026-10-29 01:59:00',120),CONVERT(datetime2,N'2026-11-01 10:59:00',120),CONVERT(datetime2,N'2026-11-01 10:59:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-01 10:59:00',120)),
+(N'LP-SIM-00637',N'Small',CONVERT(datetime2,N'2026-10-19 13:20:00',120),CONVERT(datetime2,N'2026-10-23 01:20:00',120),CONVERT(datetime2,N'2026-10-23 01:20:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-23 01:20:00',120)),
+(N'LP-SIM-00638',N'Large',CONVERT(datetime2,N'2026-11-10 02:14:00',120),CONVERT(datetime2,N'2026-11-13 06:14:00',120),CONVERT(datetime2,N'2026-11-13 06:14:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-13 06:14:00',120)),
+(N'LP-SIM-00639',N'Large',CONVERT(datetime2,N'2026-10-21 14:56:00',120),CONVERT(datetime2,N'2026-10-26 02:56:00',120),CONVERT(datetime2,N'2026-10-26 02:56:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-26 02:56:00',120)),
+(N'LP-SIM-00640',N'Small',CONVERT(datetime2,N'2026-11-13 03:22:00',120),CONVERT(datetime2,N'2026-11-15 13:22:00',120),CONVERT(datetime2,N'2026-11-15 13:22:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-15 13:22:00',120)),
+(N'LP-SIM-00641',N'Medium',CONVERT(datetime2,N'2026-11-08 02:06:00',120),CONVERT(datetime2,N'2026-11-09 05:06:00',120),CONVERT(datetime2,N'2026-11-09 05:06:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-09 05:06:00',120)),
+(N'LP-SIM-00642',N'Small',CONVERT(datetime2,N'2026-10-21 00:43:00',120),CONVERT(datetime2,N'2026-10-25 09:43:00',120),CONVERT(datetime2,N'2026-10-25 09:43:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-25 09:43:00',120)),
+(N'LP-SIM-00643',N'Medium',CONVERT(datetime2,N'2026-10-17 03:05:00',120),CONVERT(datetime2,N'2026-10-20 13:05:00',120),CONVERT(datetime2,N'2026-10-20 13:05:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-20 13:05:00',120)),
+(N'LP-SIM-00644',N'Small',CONVERT(datetime2,N'2026-10-20 10:58:00',120),CONVERT(datetime2,N'2026-10-24 15:58:00',120),CONVERT(datetime2,N'2026-10-24 15:58:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-24 15:58:00',120)),
+(N'LP-SIM-00645',N'Small',CONVERT(datetime2,N'2026-10-25 02:13:00',120),CONVERT(datetime2,N'2026-10-26 02:13:00',120),CONVERT(datetime2,N'2026-10-26 02:13:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-10-29 02:13:00',120)),
+(N'LP-SIM-00646',N'Medium',CONVERT(datetime2,N'2026-11-08 04:55:00',120),CONVERT(datetime2,N'2026-11-11 15:55:00',120),CONVERT(datetime2,N'2026-11-11 15:55:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-11 15:55:00',120)),
+(N'LP-SIM-00647',N'Medium',CONVERT(datetime2,N'2026-10-17 01:58:00',120),CONVERT(datetime2,N'2026-10-18 13:58:00',120),CONVERT(datetime2,N'2026-10-18 13:58:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-18 13:58:00',120)),
+(N'LP-SIM-00648',N'Medium',CONVERT(datetime2,N'2026-10-21 14:50:00',120),CONVERT(datetime2,N'2026-10-25 14:50:00',120),CONVERT(datetime2,N'2026-10-25 14:50:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-01 14:50:00',120)),
+(N'LP-SIM-00649',N'Small',CONVERT(datetime2,N'2026-11-05 13:01:00',120),CONVERT(datetime2,N'2026-11-07 18:01:00',120),CONVERT(datetime2,N'2026-11-07 18:01:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-07 18:01:00',120)),
+(N'LP-SIM-00650',N'Medium',CONVERT(datetime2,N'2026-10-31 11:59:00',120),CONVERT(datetime2,N'2026-11-04 23:59:00',120),CONVERT(datetime2,N'2026-11-04 23:59:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-04 23:59:00',120)),
+(N'LP-SIM-00651',N'Large',CONVERT(datetime2,N'2026-11-12 23:23:00',120),CONVERT(datetime2,N'2026-11-17 10:23:00',120),CONVERT(datetime2,N'2026-11-17 10:23:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-17 10:23:00',120)),
+(N'LP-SIM-00652',N'Medium',CONVERT(datetime2,N'2026-11-07 12:06:00',120),CONVERT(datetime2,N'2026-11-09 23:06:00',120),CONVERT(datetime2,N'2026-11-09 23:06:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-09 23:06:00',120)),
+(N'LP-SIM-00653',N'Medium',CONVERT(datetime2,N'2026-10-25 13:32:00',120),CONVERT(datetime2,N'2026-10-26 13:32:00',120),CONVERT(datetime2,N'2026-10-26 13:32:00',120),CONVERT(datetime2,N'2026-10-27 10:32:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-27 10:32:00',120)),
+(N'LP-SIM-00654',N'Small',CONVERT(datetime2,N'2026-10-21 11:40:00',120),CONVERT(datetime2,N'2026-10-25 13:40:00',120),CONVERT(datetime2,N'2026-10-25 13:40:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-25 13:40:00',120)),
+(N'LP-SIM-00655',N'Medium',CONVERT(datetime2,N'2026-11-02 10:32:00',120),CONVERT(datetime2,N'2026-11-06 10:32:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-06 06:32:00',120)),
+(N'LP-SIM-00656',N'Small',CONVERT(datetime2,N'2026-10-17 00:33:00',120),CONVERT(datetime2,N'2026-10-19 05:33:00',120),CONVERT(datetime2,N'2026-10-19 05:33:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-19 05:33:00',120)),
+(N'LP-SIM-00657',N'Small',CONVERT(datetime2,N'2026-11-04 06:46:00',120),CONVERT(datetime2,N'2026-11-06 15:46:00',120),CONVERT(datetime2,N'2026-11-06 15:46:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-06 15:46:00',120)),
+(N'LP-SIM-00658',N'Large',CONVERT(datetime2,N'2026-11-12 13:57:00',120),CONVERT(datetime2,N'2026-11-15 19:57:00',120),CONVERT(datetime2,N'2026-11-15 19:57:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-11-15 19:57:00',120)),
+(N'LP-SIM-00659',N'Small',CONVERT(datetime2,N'2026-11-11 11:55:00',120),CONVERT(datetime2,N'2026-11-12 17:55:00',120),CONVERT(datetime2,N'2026-11-12 17:55:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-12 17:55:00',120)),
+(N'LP-SIM-00660',N'Medium',CONVERT(datetime2,N'2026-11-06 06:36:00',120),CONVERT(datetime2,N'2026-11-09 07:36:00',120),CONVERT(datetime2,N'2026-11-09 07:36:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-09 07:36:00',120)),
+(N'LP-SIM-00661',N'Medium',CONVERT(datetime2,N'2026-10-25 15:36:00',120),CONVERT(datetime2,N'2026-10-26 23:36:00',120),CONVERT(datetime2,N'2026-10-26 23:36:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-26 23:36:00',120)),
+(N'LP-SIM-00662',N'Small',CONVERT(datetime2,N'2026-11-01 07:57:00',120),CONVERT(datetime2,N'2026-11-04 09:57:00',120),CONVERT(datetime2,N'2026-11-04 09:57:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-04 09:57:00',120)),
+(N'LP-SIM-00663',N'Small',CONVERT(datetime2,N'2026-10-28 18:09:00',120),CONVERT(datetime2,N'2026-11-01 02:09:00',120),CONVERT(datetime2,N'2026-11-01 02:09:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-01 02:09:00',120)),
+(N'LP-SIM-00664',N'Small',CONVERT(datetime2,N'2026-10-18 00:48:00',120),CONVERT(datetime2,N'2026-10-20 09:48:00',120),CONVERT(datetime2,N'2026-10-20 09:48:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-20 09:48:00',120)),
+(N'LP-SIM-00665',N'Small',CONVERT(datetime2,N'2026-11-06 19:45:00',120),CONVERT(datetime2,N'2026-11-10 19:45:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-10 14:45:00',120)),
+(N'LP-SIM-00666',N'Small',CONVERT(datetime2,N'2026-11-12 11:05:00',120),CONVERT(datetime2,N'2026-11-15 14:05:00',120),CONVERT(datetime2,N'2026-11-15 14:05:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-11-15 14:05:00',120)),
+(N'LP-SIM-00667',N'Small',CONVERT(datetime2,N'2026-10-21 19:47:00',120),CONVERT(datetime2,N'2026-10-24 02:47:00',120),CONVERT(datetime2,N'2026-10-24 02:47:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-24 02:47:00',120)),
+(N'LP-SIM-00668',N'Medium',CONVERT(datetime2,N'2026-11-09 13:58:00',120),CONVERT(datetime2,N'2026-11-11 13:58:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-11 07:58:00',120)),
+(N'LP-SIM-00669',N'Small',CONVERT(datetime2,N'2026-11-04 01:57:00',120),CONVERT(datetime2,N'2026-11-07 03:57:00',120),CONVERT(datetime2,N'2026-11-07 03:57:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-07 03:57:00',120)),
+(N'LP-SIM-00670',N'Small',CONVERT(datetime2,N'2026-11-11 19:33:00',120),CONVERT(datetime2,N'2026-11-15 19:33:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-15 08:33:00',120)),
+(N'LP-SIM-00671',N'Small',CONVERT(datetime2,N'2026-11-09 20:17:00',120),CONVERT(datetime2,N'2026-11-10 22:17:00',120),CONVERT(datetime2,N'2026-11-10 22:17:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-10 22:17:00',120)),
+(N'LP-SIM-00672',N'Small',CONVERT(datetime2,N'2026-11-04 00:18:00',120),CONVERT(datetime2,N'2026-11-05 12:18:00',120),CONVERT(datetime2,N'2026-11-05 12:18:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-05 12:18:00',120)),
+(N'LP-SIM-00673',N'Medium',CONVERT(datetime2,N'2026-10-21 17:26:00',120),CONVERT(datetime2,N'2026-10-24 00:26:00',120),CONVERT(datetime2,N'2026-10-24 00:26:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-24 00:26:00',120)),
+(N'LP-SIM-00674',N'Small',CONVERT(datetime2,N'2026-10-15 13:38:00',120),CONVERT(datetime2,N'2026-10-19 13:38:00',120),CONVERT(datetime2,N'2026-10-19 13:38:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-19 13:38:00',120)),
+(N'LP-SIM-00675',N'Medium',CONVERT(datetime2,N'2026-11-07 04:32:00',120),CONVERT(datetime2,N'2026-11-10 16:32:00',120),CONVERT(datetime2,N'2026-11-10 16:32:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-10 16:32:00',120)),
+(N'LP-SIM-00676',N'Small',CONVERT(datetime2,N'2026-11-06 22:38:00',120),CONVERT(datetime2,N'2026-11-09 03:38:00',120),CONVERT(datetime2,N'2026-11-09 03:38:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-09 03:38:00',120)),
+(N'LP-SIM-00677',N'Small',CONVERT(datetime2,N'2026-11-04 23:01:00',120),CONVERT(datetime2,N'2026-11-08 23:01:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-08 22:01:00',120)),
+(N'LP-SIM-00678',N'Small',CONVERT(datetime2,N'2026-10-25 12:18:00',120),CONVERT(datetime2,N'2026-10-29 12:18:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 04:18:00',120)),
+(N'LP-SIM-00679',N'Medium',CONVERT(datetime2,N'2026-10-25 12:52:00',120),CONVERT(datetime2,N'2026-10-29 15:52:00',120),CONVERT(datetime2,N'2026-10-29 15:52:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-29 15:52:00',120)),
+(N'LP-SIM-00680',N'Small',CONVERT(datetime2,N'2026-11-06 17:10:00',120),CONVERT(datetime2,N'2026-11-09 00:10:00',120),CONVERT(datetime2,N'2026-11-09 00:10:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-09 00:10:00',120)),
+(N'LP-SIM-00681',N'Medium',CONVERT(datetime2,N'2026-10-25 12:17:00',120),CONVERT(datetime2,N'2026-10-26 12:17:00',120),CONVERT(datetime2,N'2026-10-26 12:17:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-26 12:17:00',120)),
+(N'LP-SIM-00682',N'Medium',CONVERT(datetime2,N'2026-10-24 00:38:00',120),CONVERT(datetime2,N'2026-10-25 03:38:00',120),CONVERT(datetime2,N'2026-10-25 03:38:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-25 03:38:00',120)),
+(N'LP-SIM-00683',N'Medium',CONVERT(datetime2,N'2026-11-09 15:48:00',120),CONVERT(datetime2,N'2026-11-11 15:48:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-11 12:48:00',120)),
+(N'LP-SIM-00684',N'Small',CONVERT(datetime2,N'2026-11-12 02:49:00',120),CONVERT(datetime2,N'2026-11-14 06:49:00',120),CONVERT(datetime2,N'2026-11-14 06:49:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-14 06:49:00',120)),
+(N'LP-SIM-00685',N'Large',CONVERT(datetime2,N'2026-10-24 14:34:00',120),CONVERT(datetime2,N'2026-10-28 14:34:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-28 11:34:00',120)),
+(N'LP-SIM-00686',N'Medium',CONVERT(datetime2,N'2026-11-09 20:34:00',120),CONVERT(datetime2,N'2026-11-12 04:34:00',120),CONVERT(datetime2,N'2026-11-12 04:34:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-12 04:34:00',120)),
+(N'LP-SIM-00687',N'Small',CONVERT(datetime2,N'2026-10-24 20:37:00',120),CONVERT(datetime2,N'2026-10-25 20:37:00',120),CONVERT(datetime2,N'2026-10-25 20:37:00',120),CONVERT(datetime2,N'2026-10-27 21:37:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-27 21:37:00',120)),
+(N'LP-SIM-00688',N'Small',CONVERT(datetime2,N'2026-11-10 10:06:00',120),CONVERT(datetime2,N'2026-11-12 11:06:00',120),CONVERT(datetime2,N'2026-11-12 11:06:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-12 11:06:00',120)),
+(N'LP-SIM-00689',N'Small',CONVERT(datetime2,N'2026-11-10 15:31:00',120),CONVERT(datetime2,N'2026-11-13 21:31:00',120),CONVERT(datetime2,N'2026-11-13 21:31:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-13 21:31:00',120)),
+(N'LP-SIM-00690',N'Small',CONVERT(datetime2,N'2026-10-21 01:45:00',120),CONVERT(datetime2,N'2026-10-25 04:45:00',120),CONVERT(datetime2,N'2026-10-25 04:45:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-25 04:45:00',120)),
+(N'LP-SIM-00691',N'Small',CONVERT(datetime2,N'2026-10-28 09:16:00',120),CONVERT(datetime2,N'2026-10-29 18:16:00',120),CONVERT(datetime2,N'2026-10-29 18:16:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-29 18:16:00',120)),
+(N'LP-SIM-00692',N'Medium',CONVERT(datetime2,N'2026-10-24 12:06:00',120),CONVERT(datetime2,N'2026-10-25 12:06:00',120),CONVERT(datetime2,N'2026-10-25 12:06:00',120),CONVERT(datetime2,N'2026-10-27 15:06:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-27 15:06:00',120)),
+(N'LP-SIM-00693',N'Small',CONVERT(datetime2,N'2026-10-18 22:56:00',120),CONVERT(datetime2,N'2026-10-22 06:56:00',120),CONVERT(datetime2,N'2026-10-22 06:56:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-22 06:56:00',120)),
+(N'LP-SIM-00694',N'Small',CONVERT(datetime2,N'2026-10-27 15:51:00',120),CONVERT(datetime2,N'2026-10-28 22:51:00',120),CONVERT(datetime2,N'2026-10-28 22:51:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-28 22:51:00',120)),
+(N'LP-SIM-00695',N'Small',CONVERT(datetime2,N'2026-11-12 09:43:00',120),CONVERT(datetime2,N'2026-11-15 09:43:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-15 04:43:00',120)),
+(N'LP-SIM-00696',N'Small',CONVERT(datetime2,N'2026-10-24 17:53:00',120),CONVERT(datetime2,N'2026-10-27 17:53:00',120),CONVERT(datetime2,N'2026-10-27 17:53:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-03 17:53:00',120)),
+(N'LP-SIM-00697',N'Medium',CONVERT(datetime2,N'2026-10-26 13:07:00',120),CONVERT(datetime2,N'2026-10-28 14:07:00',120),CONVERT(datetime2,N'2026-10-28 14:07:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-28 14:07:00',120)),
+(N'LP-SIM-00698',N'Medium',CONVERT(datetime2,N'2026-10-25 06:48:00',120),CONVERT(datetime2,N'2026-10-26 15:48:00',120),CONVERT(datetime2,N'2026-10-26 15:48:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-26 15:48:00',120)),
+(N'LP-SIM-00699',N'Medium',CONVERT(datetime2,N'2026-10-17 13:47:00',120),CONVERT(datetime2,N'2026-10-21 15:47:00',120),CONVERT(datetime2,N'2026-10-21 15:47:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-21 15:47:00',120)),
+(N'LP-SIM-00700',N'Large',CONVERT(datetime2,N'2026-10-28 13:04:00',120),CONVERT(datetime2,N'2026-10-30 15:04:00',120),CONVERT(datetime2,N'2026-10-30 15:04:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-30 15:04:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00701',N'Small',CONVERT(datetime2,N'2026-11-05 23:59:00',120),CONVERT(datetime2,N'2026-11-09 23:59:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-09 14:59:00',120)),
+(N'LP-SIM-00702',N'Small',CONVERT(datetime2,N'2026-10-24 11:44:00',120),CONVERT(datetime2,N'2026-10-27 16:44:00',120),CONVERT(datetime2,N'2026-10-27 16:44:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-27 16:44:00',120)),
+(N'LP-SIM-00703',N'Medium',CONVERT(datetime2,N'2026-10-24 07:06:00',120),CONVERT(datetime2,N'2026-10-28 18:06:00',120),CONVERT(datetime2,N'2026-10-28 18:06:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-28 18:06:00',120)),
+(N'LP-SIM-00704',N'Small',CONVERT(datetime2,N'2026-10-31 11:46:00',120),CONVERT(datetime2,N'2026-11-03 22:46:00',120),CONVERT(datetime2,N'2026-11-03 22:46:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-03 22:46:00',120)),
+(N'LP-SIM-00705',N'Small',CONVERT(datetime2,N'2026-11-07 19:00:00',120),CONVERT(datetime2,N'2026-11-11 19:00:00',120),CONVERT(datetime2,N'2026-11-11 19:00:00',120),CONVERT(datetime2,N'2026-11-13 11:00:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-13 11:00:00',120)),
+(N'LP-SIM-00706',N'Small',CONVERT(datetime2,N'2026-10-22 08:48:00',120),CONVERT(datetime2,N'2026-10-23 08:48:00',120),CONVERT(datetime2,N'2026-10-23 08:48:00',120),CONVERT(datetime2,N'2026-10-26 05:48:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-26 05:48:00',120)),
+(N'LP-SIM-00707',N'Small',CONVERT(datetime2,N'2026-10-29 12:42:00',120),CONVERT(datetime2,N'2026-10-31 13:42:00',120),CONVERT(datetime2,N'2026-10-31 13:42:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-31 13:42:00',120)),
+(N'LP-SIM-00708',N'Large',CONVERT(datetime2,N'2026-11-07 10:29:00',120),CONVERT(datetime2,N'2026-11-11 10:29:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-11 04:29:00',120)),
+(N'LP-SIM-00709',N'Medium',CONVERT(datetime2,N'2026-10-25 16:18:00',120),CONVERT(datetime2,N'2026-10-26 17:18:00',120),CONVERT(datetime2,N'2026-10-26 17:18:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-26 17:18:00',120)),
+(N'LP-SIM-00710',N'Medium',CONVERT(datetime2,N'2026-10-27 15:55:00',120),CONVERT(datetime2,N'2026-10-31 16:55:00',120),CONVERT(datetime2,N'2026-10-31 16:55:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-31 16:55:00',120)),
+(N'LP-SIM-00711',N'Large',CONVERT(datetime2,N'2026-11-07 01:36:00',120),CONVERT(datetime2,N'2026-11-11 05:36:00',120),CONVERT(datetime2,N'2026-11-11 05:36:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-11 05:36:00',120)),
+(N'LP-SIM-00712',N'Medium',CONVERT(datetime2,N'2026-10-20 18:00:00',120),CONVERT(datetime2,N'2026-10-23 18:00:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-23 14:00:00',120)),
+(N'LP-SIM-00713',N'Medium',CONVERT(datetime2,N'2026-11-08 00:37:00',120),CONVERT(datetime2,N'2026-11-11 00:37:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-10 13:37:00',120)),
+(N'LP-SIM-00714',N'Medium',CONVERT(datetime2,N'2026-11-11 23:39:00',120),CONVERT(datetime2,N'2026-11-15 11:39:00',120),CONVERT(datetime2,N'2026-11-15 11:39:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-15 11:39:00',120)),
+(N'LP-SIM-00715',N'Medium',CONVERT(datetime2,N'2026-11-12 22:24:00',120),CONVERT(datetime2,N'2026-11-17 09:24:00',120),CONVERT(datetime2,N'2026-11-17 09:24:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-17 09:24:00',120)),
+(N'LP-SIM-00716',N'Small',CONVERT(datetime2,N'2026-10-30 08:54:00',120),CONVERT(datetime2,N'2026-11-01 19:54:00',120),CONVERT(datetime2,N'2026-11-01 19:54:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-01 19:54:00',120)),
+(N'LP-SIM-00717',N'Small',CONVERT(datetime2,N'2026-10-20 00:50:00',120),CONVERT(datetime2,N'2026-10-23 00:50:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-22 21:50:00',120)),
+(N'LP-SIM-00718',N'Medium',CONVERT(datetime2,N'2026-10-15 21:02:00',120),CONVERT(datetime2,N'2026-10-17 01:02:00',120),CONVERT(datetime2,N'2026-10-17 01:02:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-17 01:02:00',120)),
+(N'LP-SIM-00719',N'Large',CONVERT(datetime2,N'2026-10-28 14:52:00',120),CONVERT(datetime2,N'2026-10-30 15:52:00',120),CONVERT(datetime2,N'2026-10-30 15:52:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-30 15:52:00',120)),
+(N'LP-SIM-00720',N'Medium',CONVERT(datetime2,N'2026-11-01 12:24:00',120),CONVERT(datetime2,N'2026-11-03 12:24:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-03 10:24:00',120)),
+(N'LP-SIM-00721',N'Medium',CONVERT(datetime2,N'2026-11-03 05:00:00',120),CONVERT(datetime2,N'2026-11-06 10:00:00',120),CONVERT(datetime2,N'2026-11-06 10:00:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-11-06 10:00:00',120)),
+(N'LP-SIM-00722',N'Small',CONVERT(datetime2,N'2026-10-22 00:34:00',120),CONVERT(datetime2,N'2026-10-23 10:34:00',120),CONVERT(datetime2,N'2026-10-23 10:34:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-10-23 10:34:00',120)),
+(N'LP-SIM-00723',N'Large',CONVERT(datetime2,N'2026-11-13 22:11:00',120),CONVERT(datetime2,N'2026-11-16 22:11:00',120),CONVERT(datetime2,N'2026-11-16 22:11:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-16 22:11:00',120)),
+(N'LP-SIM-00724',N'Medium',CONVERT(datetime2,N'2026-11-12 13:39:00',120),CONVERT(datetime2,N'2026-11-16 22:39:00',120),CONVERT(datetime2,N'2026-11-16 22:39:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-16 22:39:00',120)),
+(N'LP-SIM-00725',N'Small',CONVERT(datetime2,N'2026-10-28 12:49:00',120),CONVERT(datetime2,N'2026-11-01 12:49:00',120),CONVERT(datetime2,N'2026-11-01 12:49:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-05 12:49:00',120)),
+(N'LP-SIM-00726',N'Medium',CONVERT(datetime2,N'2026-11-08 07:35:00',120),CONVERT(datetime2,N'2026-11-12 07:35:00',120),CONVERT(datetime2,N'2026-11-12 07:35:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-19 07:35:00',120)),
+(N'LP-SIM-00727',N'Small',CONVERT(datetime2,N'2026-11-06 09:05:00',120),CONVERT(datetime2,N'2026-11-07 17:05:00',120),CONVERT(datetime2,N'2026-11-07 17:05:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-07 17:05:00',120)),
+(N'LP-SIM-00728',N'Large',CONVERT(datetime2,N'2026-11-03 13:28:00',120),CONVERT(datetime2,N'2026-11-06 20:28:00',120),CONVERT(datetime2,N'2026-11-06 20:28:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-06 20:28:00',120)),
+(N'LP-SIM-00729',N'Small',CONVERT(datetime2,N'2026-11-01 16:22:00',120),CONVERT(datetime2,N'2026-11-04 21:22:00',120),CONVERT(datetime2,N'2026-11-04 21:22:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-04 21:22:00',120)),
+(N'LP-SIM-00730',N'Small',CONVERT(datetime2,N'2026-10-16 17:25:00',120),CONVERT(datetime2,N'2026-10-17 20:25:00',120),CONVERT(datetime2,N'2026-10-17 20:25:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-10-17 20:25:00',120)),
+(N'LP-SIM-00731',N'Large',CONVERT(datetime2,N'2026-10-19 07:09:00',120),CONVERT(datetime2,N'2026-10-23 17:09:00',120),CONVERT(datetime2,N'2026-10-23 17:09:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-23 17:09:00',120)),
+(N'LP-SIM-00732',N'Medium',CONVERT(datetime2,N'2026-11-12 00:39:00',120),CONVERT(datetime2,N'2026-11-15 00:39:00',120),CONVERT(datetime2,N'2026-11-15 00:39:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-18 00:39:00',120)),
+(N'LP-SIM-00733',N'Small',CONVERT(datetime2,N'2026-10-26 19:25:00',120),CONVERT(datetime2,N'2026-10-29 07:25:00',120),CONVERT(datetime2,N'2026-10-29 07:25:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-29 07:25:00',120)),
+(N'LP-SIM-00734',N'Medium',CONVERT(datetime2,N'2026-10-21 18:40:00',120),CONVERT(datetime2,N'2026-10-22 18:40:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-22 14:40:00',120)),
+(N'LP-SIM-00735',N'Small',CONVERT(datetime2,N'2026-11-10 07:04:00',120),CONVERT(datetime2,N'2026-11-12 07:04:00',120),CONVERT(datetime2,N'2026-11-12 07:04:00',120),CONVERT(datetime2,N'2026-11-14 20:04:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-14 20:04:00',120)),
+(N'LP-SIM-00736',N'Large',CONVERT(datetime2,N'2026-11-07 09:30:00',120),CONVERT(datetime2,N'2026-11-08 12:30:00',120),CONVERT(datetime2,N'2026-11-08 12:30:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-08 12:30:00',120)),
+(N'LP-SIM-00737',N'Small',CONVERT(datetime2,N'2026-10-23 02:28:00',120),CONVERT(datetime2,N'2026-10-25 10:28:00',120),CONVERT(datetime2,N'2026-10-25 10:28:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-25 10:28:00',120)),
+(N'LP-SIM-00738',N'Medium',CONVERT(datetime2,N'2026-10-22 21:08:00',120),CONVERT(datetime2,N'2026-10-26 21:08:00',120),CONVERT(datetime2,N'2026-10-26 21:08:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-26 21:08:00',120)),
+(N'LP-SIM-00739',N'Small',CONVERT(datetime2,N'2026-11-02 08:38:00',120),CONVERT(datetime2,N'2026-11-04 10:38:00',120),CONVERT(datetime2,N'2026-11-04 10:38:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-11-04 10:38:00',120)),
+(N'LP-SIM-00740',N'Medium',CONVERT(datetime2,N'2026-10-28 12:43:00',120),CONVERT(datetime2,N'2026-10-31 21:43:00',120),CONVERT(datetime2,N'2026-10-31 21:43:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-31 21:43:00',120)),
+(N'LP-SIM-00741',N'Small',CONVERT(datetime2,N'2026-10-20 23:12:00',120),CONVERT(datetime2,N'2026-10-25 00:12:00',120),CONVERT(datetime2,N'2026-10-25 00:12:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-25 00:12:00',120)),
+(N'LP-SIM-00742',N'Small',CONVERT(datetime2,N'2026-10-19 01:30:00',120),CONVERT(datetime2,N'2026-10-20 04:30:00',120),CONVERT(datetime2,N'2026-10-20 04:30:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-20 04:30:00',120)),
+(N'LP-SIM-00743',N'Large',CONVERT(datetime2,N'2026-10-16 06:01:00',120),CONVERT(datetime2,N'2026-10-18 06:01:00',120),CONVERT(datetime2,N'2026-10-18 06:01:00',120),CONVERT(datetime2,N'2026-10-20 09:01:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-20 09:01:00',120)),
+(N'LP-SIM-00744',N'Medium',CONVERT(datetime2,N'2026-11-05 04:04:00',120),CONVERT(datetime2,N'2026-11-07 04:04:00',120),CONVERT(datetime2,N'2026-11-07 04:04:00',120),CONVERT(datetime2,N'2026-11-08 19:04:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-08 19:04:00',120)),
+(N'LP-SIM-00745',N'Medium',CONVERT(datetime2,N'2026-10-28 20:47:00',120),CONVERT(datetime2,N'2026-11-02 03:47:00',120),CONVERT(datetime2,N'2026-11-02 03:47:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-02 03:47:00',120)),
+(N'LP-SIM-00746',N'Small',CONVERT(datetime2,N'2026-11-01 22:43:00',120),CONVERT(datetime2,N'2026-11-03 22:43:00',120),CONVERT(datetime2,N'2026-11-03 22:43:00',120),CONVERT(datetime2,N'2026-11-04 01:43:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-04 01:43:00',120)),
+(N'LP-SIM-00747',N'Small',CONVERT(datetime2,N'2026-10-16 02:15:00',120),CONVERT(datetime2,N'2026-10-20 06:15:00',120),CONVERT(datetime2,N'2026-10-20 06:15:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-20 06:15:00',120)),
+(N'LP-SIM-00748',N'Medium',CONVERT(datetime2,N'2026-11-04 22:22:00',120),CONVERT(datetime2,N'2026-11-07 05:22:00',120),CONVERT(datetime2,N'2026-11-07 05:22:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-07 05:22:00',120)),
+(N'LP-SIM-00749',N'Medium',CONVERT(datetime2,N'2026-11-05 13:42:00',120),CONVERT(datetime2,N'2026-11-07 15:42:00',120),CONVERT(datetime2,N'2026-11-07 15:42:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-07 15:42:00',120)),
+(N'LP-SIM-00750',N'Medium',CONVERT(datetime2,N'2026-10-22 17:42:00',120),CONVERT(datetime2,N'2026-10-23 17:42:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-23 15:42:00',120)),
+(N'LP-SIM-00751',N'Large',CONVERT(datetime2,N'2026-10-29 16:05:00',120),CONVERT(datetime2,N'2026-10-31 00:05:00',120),CONVERT(datetime2,N'2026-10-31 00:05:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-31 00:05:00',120)),
+(N'LP-SIM-00752',N'Medium',CONVERT(datetime2,N'2026-10-28 19:08:00',120),CONVERT(datetime2,N'2026-10-29 19:08:00',120),CONVERT(datetime2,N'2026-10-29 19:08:00',120),CONVERT(datetime2,N'2026-10-30 04:08:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-10-30 04:08:00',120)),
+(N'LP-SIM-00753',N'Small',CONVERT(datetime2,N'2026-10-20 15:20:00',120),CONVERT(datetime2,N'2026-10-21 21:20:00',120),CONVERT(datetime2,N'2026-10-21 21:20:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-21 21:20:00',120)),
+(N'LP-SIM-00754',N'Small',CONVERT(datetime2,N'2026-11-03 04:35:00',120),CONVERT(datetime2,N'2026-11-07 04:35:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-06 18:35:00',120)),
+(N'LP-SIM-00755',N'Small',CONVERT(datetime2,N'2026-10-31 22:55:00',120),CONVERT(datetime2,N'2026-11-04 00:55:00',120),CONVERT(datetime2,N'2026-11-04 00:55:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-04 00:55:00',120)),
+(N'LP-SIM-00756',N'Small',CONVERT(datetime2,N'2026-11-07 03:46:00',120),CONVERT(datetime2,N'2026-11-11 03:46:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-10 20:46:00',120)),
+(N'LP-SIM-00757',N'Medium',CONVERT(datetime2,N'2026-11-04 08:34:00',120),CONVERT(datetime2,N'2026-11-06 16:34:00',120),CONVERT(datetime2,N'2026-11-06 16:34:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-06 16:34:00',120)),
+(N'LP-SIM-00758',N'Small',CONVERT(datetime2,N'2026-11-04 22:32:00',120),CONVERT(datetime2,N'2026-11-09 07:32:00',120),CONVERT(datetime2,N'2026-11-09 07:32:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-09 07:32:00',120)),
+(N'LP-SIM-00759',N'Medium',CONVERT(datetime2,N'2026-10-17 22:01:00',120),CONVERT(datetime2,N'2026-10-20 22:01:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-20 17:01:00',120)),
+(N'LP-SIM-00760',N'Large',CONVERT(datetime2,N'2026-10-20 09:39:00',120),CONVERT(datetime2,N'2026-10-22 14:39:00',120),CONVERT(datetime2,N'2026-10-22 14:39:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-22 14:39:00',120)),
+(N'LP-SIM-00761',N'Small',CONVERT(datetime2,N'2026-11-01 10:29:00',120),CONVERT(datetime2,N'2026-11-04 13:29:00',120),CONVERT(datetime2,N'2026-11-04 13:29:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-04 13:29:00',120)),
+(N'LP-SIM-00762',N'Small',CONVERT(datetime2,N'2026-11-02 01:49:00',120),CONVERT(datetime2,N'2026-11-05 06:49:00',120),CONVERT(datetime2,N'2026-11-05 06:49:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-11-05 06:49:00',120)),
+(N'LP-SIM-00763',N'Medium',CONVERT(datetime2,N'2026-11-08 05:56:00',120),CONVERT(datetime2,N'2026-11-11 06:56:00',120),CONVERT(datetime2,N'2026-11-11 06:56:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-11 06:56:00',120)),
+(N'LP-SIM-00764',N'Small',CONVERT(datetime2,N'2026-11-10 09:26:00',120),CONVERT(datetime2,N'2026-11-14 09:26:00',120),CONVERT(datetime2,N'2026-11-14 09:26:00',120),CONVERT(datetime2,N'2026-11-15 12:26:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-15 12:26:00',120)),
+(N'LP-SIM-00765',N'Small',CONVERT(datetime2,N'2026-10-24 10:27:00',120),CONVERT(datetime2,N'2026-10-27 10:27:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-27 04:27:00',120)),
+(N'LP-SIM-00766',N'Medium',CONVERT(datetime2,N'2026-11-10 17:45:00',120),CONVERT(datetime2,N'2026-11-13 17:45:00',120),CONVERT(datetime2,N'2026-11-13 17:45:00',120),CONVERT(datetime2,N'2026-11-15 11:45:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-15 11:45:00',120)),
+(N'LP-SIM-00767',N'Medium',CONVERT(datetime2,N'2026-10-23 05:56:00',120),CONVERT(datetime2,N'2026-10-25 13:56:00',120),CONVERT(datetime2,N'2026-10-25 13:56:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-25 13:56:00',120)),
+(N'LP-SIM-00768',N'Small',CONVERT(datetime2,N'2026-10-31 00:00:00',120),CONVERT(datetime2,N'2026-11-01 00:00:00',120),CONVERT(datetime2,N'2026-11-01 00:00:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-01 00:00:00',120)),
+(N'LP-SIM-00769',N'Small',CONVERT(datetime2,N'2026-11-04 03:45:00',120),CONVERT(datetime2,N'2026-11-08 03:45:00',120),CONVERT(datetime2,N'2026-11-08 03:45:00',120),CONVERT(datetime2,N'2026-11-10 15:45:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-10 15:45:00',120)),
+(N'LP-SIM-00770',N'Medium',CONVERT(datetime2,N'2026-11-02 20:03:00',120),CONVERT(datetime2,N'2026-11-04 20:03:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-04 11:03:00',120)),
+(N'LP-SIM-00771',N'Large',CONVERT(datetime2,N'2026-10-22 03:01:00',120),CONVERT(datetime2,N'2026-10-23 05:01:00',120),CONVERT(datetime2,N'2026-10-23 05:01:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-23 05:01:00',120)),
+(N'LP-SIM-00772',N'Medium',CONVERT(datetime2,N'2026-10-23 23:49:00',120),CONVERT(datetime2,N'2026-10-27 23:49:00',120),CONVERT(datetime2,N'2026-10-27 23:49:00',120),CONVERT(datetime2,N'2026-10-29 22:49:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-29 22:49:00',120)),
+(N'LP-SIM-00773',N'Medium',CONVERT(datetime2,N'2026-11-09 10:52:00',120),CONVERT(datetime2,N'2026-11-10 10:52:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-10 09:52:00',120)),
+(N'LP-SIM-00774',N'Large',CONVERT(datetime2,N'2026-11-04 02:09:00',120),CONVERT(datetime2,N'2026-11-08 13:09:00',120),CONVERT(datetime2,N'2026-11-08 13:09:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-08 13:09:00',120)),
+(N'LP-SIM-00775',N'Small',CONVERT(datetime2,N'2026-10-28 01:34:00',120),CONVERT(datetime2,N'2026-10-31 08:34:00',120),CONVERT(datetime2,N'2026-10-31 08:34:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-31 08:34:00',120)),
+(N'LP-SIM-00776',N'Small',CONVERT(datetime2,N'2026-11-02 20:16:00',120),CONVERT(datetime2,N'2026-11-05 20:16:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-05 11:16:00',120)),
+(N'LP-SIM-00777',N'Medium',CONVERT(datetime2,N'2026-10-29 12:01:00',120),CONVERT(datetime2,N'2026-11-02 12:01:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-02 10:01:00',120)),
+(N'LP-SIM-00778',N'Small',CONVERT(datetime2,N'2026-10-22 15:13:00',120),CONVERT(datetime2,N'2026-10-24 23:13:00',120),CONVERT(datetime2,N'2026-10-24 23:13:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-10-24 23:13:00',120)),
+(N'LP-SIM-00779',N'Medium',CONVERT(datetime2,N'2026-11-10 11:11:00',120),CONVERT(datetime2,N'2026-11-12 11:11:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-11 23:11:00',120)),
+(N'LP-SIM-00780',N'Small',CONVERT(datetime2,N'2026-11-02 10:59:00',120),CONVERT(datetime2,N'2026-11-03 17:59:00',120),CONVERT(datetime2,N'2026-11-03 17:59:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-03 17:59:00',120)),
+(N'LP-SIM-00781',N'Medium',CONVERT(datetime2,N'2026-11-11 04:31:00',120),CONVERT(datetime2,N'2026-11-15 07:31:00',120),CONVERT(datetime2,N'2026-11-15 07:31:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-15 07:31:00',120)),
+(N'LP-SIM-00782',N'Medium',CONVERT(datetime2,N'2026-11-06 11:45:00',120),CONVERT(datetime2,N'2026-11-07 11:45:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-07 08:45:00',120)),
+(N'LP-SIM-00783',N'Medium',CONVERT(datetime2,N'2026-10-17 12:52:00',120),CONVERT(datetime2,N'2026-10-21 22:52:00',120),CONVERT(datetime2,N'2026-10-21 22:52:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-10-21 22:52:00',120)),
+(N'LP-SIM-00784',N'Small',CONVERT(datetime2,N'2026-11-02 04:33:00',120),CONVERT(datetime2,N'2026-11-06 04:33:00',120),CONVERT(datetime2,N'2026-11-06 04:33:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-06 04:33:00',120)),
+(N'LP-SIM-00785',N'Small',CONVERT(datetime2,N'2026-10-30 05:22:00',120),CONVERT(datetime2,N'2026-11-02 10:22:00',120),CONVERT(datetime2,N'2026-11-02 10:22:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-02 10:22:00',120)),
+(N'LP-SIM-00786',N'Large',CONVERT(datetime2,N'2026-10-27 09:20:00',120),CONVERT(datetime2,N'2026-10-29 19:20:00',120),CONVERT(datetime2,N'2026-10-29 19:20:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-10-29 19:20:00',120)),
+(N'LP-SIM-00787',N'Small',CONVERT(datetime2,N'2026-10-30 02:43:00',120),CONVERT(datetime2,N'2026-11-03 02:43:00',120),CONVERT(datetime2,N'2026-11-03 02:43:00',120),CONVERT(datetime2,N'2026-11-06 02:43:00',120),N'Collected',NULL,2,CONVERT(datetime2,N'2026-11-06 02:43:00',120)),
+(N'LP-SIM-00788',N'Small',CONVERT(datetime2,N'2026-10-16 15:41:00',120),CONVERT(datetime2,N'2026-10-19 03:41:00',120),CONVERT(datetime2,N'2026-10-19 03:41:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-19 03:41:00',120)),
+(N'LP-SIM-00789',N'Small',CONVERT(datetime2,N'2026-11-09 07:50:00',120),CONVERT(datetime2,N'2026-11-10 16:50:00',120),CONVERT(datetime2,N'2026-11-10 16:50:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-10 16:50:00',120)),
+(N'LP-SIM-00790',N'Large',CONVERT(datetime2,N'2026-11-03 02:26:00',120),CONVERT(datetime2,N'2026-11-07 03:26:00',120),CONVERT(datetime2,N'2026-11-07 03:26:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-07 03:26:00',120)),
+(N'LP-SIM-00791',N'Medium',CONVERT(datetime2,N'2026-11-13 07:03:00',120),CONVERT(datetime2,N'2026-11-15 07:03:00',120),CONVERT(datetime2,N'2026-11-15 07:03:00',120),CONVERT(datetime2,N'2026-11-17 04:03:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-17 04:03:00',120)),
+(N'LP-SIM-00792',N'Medium',CONVERT(datetime2,N'2026-11-11 06:55:00',120),CONVERT(datetime2,N'2026-11-14 09:55:00',120),CONVERT(datetime2,N'2026-11-14 09:55:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-14 09:55:00',120)),
+(N'LP-SIM-00793',N'Medium',CONVERT(datetime2,N'2026-11-12 23:14:00',120),CONVERT(datetime2,N'2026-11-15 23:14:00',120),CONVERT(datetime2,N'2026-11-15 23:14:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-22 23:14:00',120)),
+(N'LP-SIM-00794',N'Medium',CONVERT(datetime2,N'2026-10-29 07:44:00',120),CONVERT(datetime2,N'2026-11-02 10:44:00',120),CONVERT(datetime2,N'2026-11-02 10:44:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-02 10:44:00',120)),
+(N'LP-SIM-00795',N'Small',CONVERT(datetime2,N'2026-11-07 08:46:00',120),CONVERT(datetime2,N'2026-11-11 08:46:00',120),CONVERT(datetime2,N'2026-11-11 08:46:00',120),CONVERT(datetime2,N'2026-11-11 10:46:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-11 10:46:00',120)),
+(N'LP-SIM-00796',N'Small',CONVERT(datetime2,N'2026-11-10 08:23:00',120),CONVERT(datetime2,N'2026-11-11 20:23:00',120),CONVERT(datetime2,N'2026-11-11 20:23:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-11 20:23:00',120)),
+(N'LP-SIM-00797',N'Medium',CONVERT(datetime2,N'2026-11-10 19:08:00',120),CONVERT(datetime2,N'2026-11-14 19:08:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-14 10:08:00',120)),
+(N'LP-SIM-00798',N'Small',CONVERT(datetime2,N'2026-10-23 03:32:00',120),CONVERT(datetime2,N'2026-10-25 13:32:00',120),CONVERT(datetime2,N'2026-10-25 13:32:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-25 13:32:00',120)),
+(N'LP-SIM-00799',N'Medium',CONVERT(datetime2,N'2026-10-31 06:13:00',120),CONVERT(datetime2,N'2026-11-01 08:13:00',120),CONVERT(datetime2,N'2026-11-01 08:13:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-01 08:13:00',120)),
+(N'LP-SIM-00800',N'Small',CONVERT(datetime2,N'2026-11-09 20:22:00',120),CONVERT(datetime2,N'2026-11-11 06:22:00',120),CONVERT(datetime2,N'2026-11-11 06:22:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-11 06:22:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00801',N'Medium',CONVERT(datetime2,N'2026-11-13 21:52:00',120),CONVERT(datetime2,N'2026-11-16 21:52:00',120),CONVERT(datetime2,N'2026-11-16 21:52:00',120),CONVERT(datetime2,N'2026-11-17 11:52:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-17 11:52:00',120)),
+(N'LP-SIM-00802',N'Small',CONVERT(datetime2,N'2026-10-16 06:39:00',120),CONVERT(datetime2,N'2026-10-19 06:39:00',120),CONVERT(datetime2,N'2026-10-19 06:39:00',120),CONVERT(datetime2,N'2026-10-20 00:39:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-10-20 00:39:00',120)),
+(N'LP-SIM-00803',N'Medium',CONVERT(datetime2,N'2026-10-29 06:23:00',120),CONVERT(datetime2,N'2026-11-02 06:23:00',120),CONVERT(datetime2,N'2026-11-02 06:23:00',120),CONVERT(datetime2,N'2026-11-02 11:23:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-02 11:23:00',120)),
+(N'LP-SIM-00804',N'Small',CONVERT(datetime2,N'2026-10-18 08:36:00',120),CONVERT(datetime2,N'2026-10-20 17:36:00',120),CONVERT(datetime2,N'2026-10-20 17:36:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-20 17:36:00',120)),
+(N'LP-SIM-00805',N'Small',CONVERT(datetime2,N'2026-10-19 11:31:00',120),CONVERT(datetime2,N'2026-10-23 11:31:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-23 05:31:00',120)),
+(N'LP-SIM-00806',N'Small',CONVERT(datetime2,N'2026-10-16 08:19:00',120),CONVERT(datetime2,N'2026-10-17 09:19:00',120),CONVERT(datetime2,N'2026-10-17 09:19:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-17 09:19:00',120)),
+(N'LP-SIM-00807',N'Medium',CONVERT(datetime2,N'2026-10-17 15:19:00',120),CONVERT(datetime2,N'2026-10-21 19:19:00',120),CONVERT(datetime2,N'2026-10-21 19:19:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-10-21 19:19:00',120)),
+(N'LP-SIM-00808',N'Small',CONVERT(datetime2,N'2026-10-31 03:13:00',120),CONVERT(datetime2,N'2026-11-03 03:13:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-02 18:13:00',120)),
+(N'LP-SIM-00809',N'Medium',CONVERT(datetime2,N'2026-11-04 20:22:00',120),CONVERT(datetime2,N'2026-11-07 02:22:00',120),CONVERT(datetime2,N'2026-11-07 02:22:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-07 02:22:00',120)),
+(N'LP-SIM-00810',N'Medium',CONVERT(datetime2,N'2026-10-18 14:25:00',120),CONVERT(datetime2,N'2026-10-22 14:25:00',120),CONVERT(datetime2,N'2026-10-22 14:25:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-22 14:25:00',120)),
+(N'LP-SIM-00811',N'Medium',CONVERT(datetime2,N'2026-10-24 07:55:00',120),CONVERT(datetime2,N'2026-10-27 11:55:00',120),CONVERT(datetime2,N'2026-10-27 11:55:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-27 11:55:00',120)),
+(N'LP-SIM-00812',N'Medium',CONVERT(datetime2,N'2026-10-17 21:33:00',120),CONVERT(datetime2,N'2026-10-20 21:33:00',120),CONVERT(datetime2,N'2026-10-20 21:33:00',120),CONVERT(datetime2,N'2026-10-22 06:33:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-22 06:33:00',120)),
+(N'LP-SIM-00813',N'Large',CONVERT(datetime2,N'2026-11-05 18:44:00',120),CONVERT(datetime2,N'2026-11-07 03:44:00',120),CONVERT(datetime2,N'2026-11-07 03:44:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-11-07 03:44:00',120)),
+(N'LP-SIM-00814',N'Small',CONVERT(datetime2,N'2026-10-26 06:18:00',120),CONVERT(datetime2,N'2026-10-28 15:18:00',120),CONVERT(datetime2,N'2026-10-28 15:18:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-10-28 15:18:00',120)),
+(N'LP-SIM-00815',N'Medium',CONVERT(datetime2,N'2026-11-04 20:22:00',120),CONVERT(datetime2,N'2026-11-08 20:22:00',120),CONVERT(datetime2,N'2026-11-08 20:22:00',120),CONVERT(datetime2,N'2026-11-09 05:22:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-09 05:22:00',120)),
+(N'LP-SIM-00816',N'Small',CONVERT(datetime2,N'2026-10-16 20:04:00',120),CONVERT(datetime2,N'2026-10-20 20:04:00',120),CONVERT(datetime2,N'2026-10-20 20:04:00',120),CONVERT(datetime2,N'2026-10-21 03:04:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-21 03:04:00',120)),
+(N'LP-SIM-00817',N'Small',CONVERT(datetime2,N'2026-11-07 15:28:00',120),CONVERT(datetime2,N'2026-11-09 17:28:00',120),CONVERT(datetime2,N'2026-11-09 17:28:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-09 17:28:00',120)),
+(N'LP-SIM-00818',N'Large',CONVERT(datetime2,N'2026-11-08 22:04:00',120),CONVERT(datetime2,N'2026-11-12 00:04:00',120),CONVERT(datetime2,N'2026-11-12 00:04:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-12 00:04:00',120)),
+(N'LP-SIM-00819',N'Medium',CONVERT(datetime2,N'2026-11-02 08:36:00',120),CONVERT(datetime2,N'2026-11-05 17:36:00',120),CONVERT(datetime2,N'2026-11-05 17:36:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-05 17:36:00',120)),
+(N'LP-SIM-00820',N'Medium',CONVERT(datetime2,N'2026-10-29 03:34:00',120),CONVERT(datetime2,N'2026-11-02 04:34:00',120),CONVERT(datetime2,N'2026-11-02 04:34:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-02 04:34:00',120)),
+(N'LP-SIM-00821',N'Small',CONVERT(datetime2,N'2026-11-08 22:31:00',120),CONVERT(datetime2,N'2026-11-12 22:31:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-12 11:31:00',120)),
+(N'LP-SIM-00822',N'Large',CONVERT(datetime2,N'2026-10-28 21:59:00',120),CONVERT(datetime2,N'2026-10-31 22:59:00',120),CONVERT(datetime2,N'2026-10-31 22:59:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-31 22:59:00',120)),
+(N'LP-SIM-00823',N'Medium',CONVERT(datetime2,N'2026-11-12 10:42:00',120),CONVERT(datetime2,N'2026-11-16 19:42:00',120),CONVERT(datetime2,N'2026-11-16 19:42:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-16 19:42:00',120)),
+(N'LP-SIM-00824',N'Medium',CONVERT(datetime2,N'2026-10-21 21:07:00',120),CONVERT(datetime2,N'2026-10-23 23:07:00',120),CONVERT(datetime2,N'2026-10-23 23:07:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-23 23:07:00',120)),
+(N'LP-SIM-00825',N'Medium',CONVERT(datetime2,N'2026-11-05 12:30:00',120),CONVERT(datetime2,N'2026-11-09 15:30:00',120),CONVERT(datetime2,N'2026-11-09 15:30:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-09 15:30:00',120)),
+(N'LP-SIM-00826',N'Medium',CONVERT(datetime2,N'2026-11-06 22:03:00',120),CONVERT(datetime2,N'2026-11-11 00:03:00',120),CONVERT(datetime2,N'2026-11-11 00:03:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-11 00:03:00',120)),
+(N'LP-SIM-00827',N'Small',CONVERT(datetime2,N'2026-10-21 03:08:00',120),CONVERT(datetime2,N'2026-10-23 07:08:00',120),CONVERT(datetime2,N'2026-10-23 07:08:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-23 07:08:00',120)),
+(N'LP-SIM-00828',N'Large',CONVERT(datetime2,N'2026-11-02 23:21:00',120),CONVERT(datetime2,N'2026-11-05 23:21:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-05 20:21:00',120)),
+(N'LP-SIM-00829',N'Medium',CONVERT(datetime2,N'2026-11-12 21:18:00',120),CONVERT(datetime2,N'2026-11-13 22:18:00',120),CONVERT(datetime2,N'2026-11-13 22:18:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-11-13 22:18:00',120)),
+(N'LP-SIM-00830',N'Small',CONVERT(datetime2,N'2026-10-31 06:54:00',120),CONVERT(datetime2,N'2026-11-02 14:54:00',120),CONVERT(datetime2,N'2026-11-02 14:54:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-02 14:54:00',120)),
+(N'LP-SIM-00831',N'Medium',CONVERT(datetime2,N'2026-10-29 08:38:00',120),CONVERT(datetime2,N'2026-10-30 12:38:00',120),CONVERT(datetime2,N'2026-10-30 12:38:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-30 12:38:00',120)),
+(N'LP-SIM-00832',N'Large',CONVERT(datetime2,N'2026-11-04 07:15:00',120),CONVERT(datetime2,N'2026-11-05 07:15:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-05 03:15:00',120)),
+(N'LP-SIM-00833',N'Medium',CONVERT(datetime2,N'2026-11-02 05:38:00',120),CONVERT(datetime2,N'2026-11-03 14:38:00',120),CONVERT(datetime2,N'2026-11-03 14:38:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-11-03 14:38:00',120)),
+(N'LP-SIM-00834',N'Medium',CONVERT(datetime2,N'2026-11-13 11:22:00',120),CONVERT(datetime2,N'2026-11-14 11:22:00',120),CONVERT(datetime2,N'2026-11-14 11:22:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-14 11:22:00',120)),
+(N'LP-SIM-00835',N'Large',CONVERT(datetime2,N'2026-11-01 00:08:00',120),CONVERT(datetime2,N'2026-11-04 00:08:00',120),CONVERT(datetime2,N'2026-11-04 00:08:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-04 00:08:00',120)),
+(N'LP-SIM-00836',N'Small',CONVERT(datetime2,N'2026-10-31 14:26:00',120),CONVERT(datetime2,N'2026-11-02 01:26:00',120),CONVERT(datetime2,N'2026-11-02 01:26:00',120),NULL,N'AtLocker',24,5,CONVERT(datetime2,N'2026-11-02 01:26:00',120)),
+(N'LP-SIM-00837',N'Medium',CONVERT(datetime2,N'2026-11-07 15:58:00',120),CONVERT(datetime2,N'2026-11-08 15:58:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-08 09:58:00',120)),
+(N'LP-SIM-00838',N'Medium',CONVERT(datetime2,N'2026-10-29 08:30:00',120),CONVERT(datetime2,N'2026-10-30 08:30:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-30 01:30:00',120)),
+(N'LP-SIM-00839',N'Medium',CONVERT(datetime2,N'2026-10-22 18:18:00',120),CONVERT(datetime2,N'2026-10-26 03:18:00',120),CONVERT(datetime2,N'2026-10-26 03:18:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-26 03:18:00',120)),
+(N'LP-SIM-00840',N'Medium',CONVERT(datetime2,N'2026-10-25 15:11:00',120),CONVERT(datetime2,N'2026-10-29 20:11:00',120),CONVERT(datetime2,N'2026-10-29 20:11:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-10-29 20:11:00',120)),
+(N'LP-SIM-00841',N'Large',CONVERT(datetime2,N'2026-11-08 01:53:00',120),CONVERT(datetime2,N'2026-11-12 12:53:00',120),CONVERT(datetime2,N'2026-11-12 12:53:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-11-12 12:53:00',120)),
+(N'LP-SIM-00842',N'Medium',CONVERT(datetime2,N'2026-10-20 17:38:00',120),CONVERT(datetime2,N'2026-10-22 20:38:00',120),CONVERT(datetime2,N'2026-10-22 20:38:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-10-22 20:38:00',120)),
+(N'LP-SIM-00843',N'Large',CONVERT(datetime2,N'2026-10-29 12:09:00',120),CONVERT(datetime2,N'2026-11-02 12:09:00',120),CONVERT(datetime2,N'2026-11-02 12:09:00',120),CONVERT(datetime2,N'2026-11-04 13:09:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-04 13:09:00',120)),
+(N'LP-SIM-00844',N'Medium',CONVERT(datetime2,N'2026-10-22 23:24:00',120),CONVERT(datetime2,N'2026-10-26 10:24:00',120),CONVERT(datetime2,N'2026-10-26 10:24:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-26 10:24:00',120)),
+(N'LP-SIM-00845',N'Small',CONVERT(datetime2,N'2026-11-07 23:11:00',120),CONVERT(datetime2,N'2026-11-11 23:11:00',120),CONVERT(datetime2,N'2026-11-11 23:11:00',120),CONVERT(datetime2,N'2026-11-13 16:11:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-11-13 16:11:00',120)),
+(N'LP-SIM-00846',N'Small',CONVERT(datetime2,N'2026-10-22 22:46:00',120),CONVERT(datetime2,N'2026-10-23 22:46:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-23 18:46:00',120)),
+(N'LP-SIM-00847',N'Small',CONVERT(datetime2,N'2026-11-06 21:36:00',120),CONVERT(datetime2,N'2026-11-10 00:36:00',120),CONVERT(datetime2,N'2026-11-10 00:36:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-10 00:36:00',120)),
+(N'LP-SIM-00848',N'Small',CONVERT(datetime2,N'2026-11-06 01:30:00',120),CONVERT(datetime2,N'2026-11-10 01:30:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-09 19:30:00',120)),
+(N'LP-SIM-00849',N'Small',CONVERT(datetime2,N'2026-11-13 18:06:00',120),CONVERT(datetime2,N'2026-11-17 20:06:00',120),CONVERT(datetime2,N'2026-11-17 20:06:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-17 20:06:00',120)),
+(N'LP-SIM-00850',N'Medium',CONVERT(datetime2,N'2026-10-31 16:46:00',120),CONVERT(datetime2,N'2026-11-02 16:46:00',120),CONVERT(datetime2,N'2026-11-02 16:46:00',120),NULL,N'Returned',NULL,4,CONVERT(datetime2,N'2026-11-06 16:46:00',120)),
+(N'LP-SIM-00851',N'Medium',CONVERT(datetime2,N'2026-10-22 15:51:00',120),CONVERT(datetime2,N'2026-10-26 16:51:00',120),CONVERT(datetime2,N'2026-10-26 16:51:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-26 16:51:00',120)),
+(N'LP-SIM-00852',N'Medium',CONVERT(datetime2,N'2026-11-13 17:54:00',120),CONVERT(datetime2,N'2026-11-17 04:54:00',120),CONVERT(datetime2,N'2026-11-17 04:54:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-17 04:54:00',120)),
+(N'LP-SIM-00853',N'Medium',CONVERT(datetime2,N'2026-10-28 17:19:00',120),CONVERT(datetime2,N'2026-10-30 20:19:00',120),CONVERT(datetime2,N'2026-10-30 20:19:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-10-30 20:19:00',120)),
+(N'LP-SIM-00854',N'Small',CONVERT(datetime2,N'2026-11-01 07:00:00',120),CONVERT(datetime2,N'2026-11-02 17:00:00',120),CONVERT(datetime2,N'2026-11-02 17:00:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-02 17:00:00',120)),
+(N'LP-SIM-00855',N'Large',CONVERT(datetime2,N'2026-11-01 10:46:00',120),CONVERT(datetime2,N'2026-11-03 19:46:00',120),CONVERT(datetime2,N'2026-11-03 19:46:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-03 19:46:00',120)),
+(N'LP-SIM-00856',N'Medium',CONVERT(datetime2,N'2026-11-01 22:51:00',120),CONVERT(datetime2,N'2026-11-05 07:51:00',120),CONVERT(datetime2,N'2026-11-05 07:51:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-05 07:51:00',120)),
+(N'LP-SIM-00857',N'Medium',CONVERT(datetime2,N'2026-10-18 23:00:00',120),CONVERT(datetime2,N'2026-10-22 10:00:00',120),CONVERT(datetime2,N'2026-10-22 10:00:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-22 10:00:00',120)),
+(N'LP-SIM-00858',N'Medium',CONVERT(datetime2,N'2026-11-04 11:43:00',120),CONVERT(datetime2,N'2026-11-07 13:43:00',120),CONVERT(datetime2,N'2026-11-07 13:43:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-07 13:43:00',120)),
+(N'LP-SIM-00859',N'Small',CONVERT(datetime2,N'2026-11-05 09:57:00',120),CONVERT(datetime2,N'2026-11-07 15:57:00',120),CONVERT(datetime2,N'2026-11-07 15:57:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-11-07 15:57:00',120)),
+(N'LP-SIM-00860',N'Small',CONVERT(datetime2,N'2026-11-06 10:50:00',120),CONVERT(datetime2,N'2026-11-08 19:50:00',120),CONVERT(datetime2,N'2026-11-08 19:50:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-08 19:50:00',120)),
+(N'LP-SIM-00861',N'Small',CONVERT(datetime2,N'2026-11-05 07:30:00',120),CONVERT(datetime2,N'2026-11-07 12:30:00',120),CONVERT(datetime2,N'2026-11-07 12:30:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-07 12:30:00',120)),
+(N'LP-SIM-00862',N'Medium',CONVERT(datetime2,N'2026-11-08 21:12:00',120),CONVERT(datetime2,N'2026-11-13 00:12:00',120),CONVERT(datetime2,N'2026-11-13 00:12:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-13 00:12:00',120)),
+(N'LP-SIM-00863',N'Medium',CONVERT(datetime2,N'2026-11-03 20:16:00',120),CONVERT(datetime2,N'2026-11-07 22:16:00',120),CONVERT(datetime2,N'2026-11-07 22:16:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-07 22:16:00',120)),
+(N'LP-SIM-00864',N'Medium',CONVERT(datetime2,N'2026-10-24 06:42:00',120),CONVERT(datetime2,N'2026-10-28 10:42:00',120),CONVERT(datetime2,N'2026-10-28 10:42:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-28 10:42:00',120)),
+(N'LP-SIM-00865',N'Medium',CONVERT(datetime2,N'2026-10-29 14:16:00',120),CONVERT(datetime2,N'2026-10-30 14:16:00',120),CONVERT(datetime2,N'2026-10-30 14:16:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-01 14:16:00',120)),
+(N'LP-SIM-00866',N'Medium',CONVERT(datetime2,N'2026-10-27 05:50:00',120),CONVERT(datetime2,N'2026-10-30 15:50:00',120),CONVERT(datetime2,N'2026-10-30 15:50:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-30 15:50:00',120)),
+(N'LP-SIM-00867',N'Large',CONVERT(datetime2,N'2026-11-01 13:26:00',120),CONVERT(datetime2,N'2026-11-03 14:26:00',120),CONVERT(datetime2,N'2026-11-03 14:26:00',120),NULL,N'AtLocker',18,4,CONVERT(datetime2,N'2026-11-03 14:26:00',120)),
+(N'LP-SIM-00868',N'Small',CONVERT(datetime2,N'2026-10-30 03:08:00',120),CONVERT(datetime2,N'2026-10-31 10:08:00',120),CONVERT(datetime2,N'2026-10-31 10:08:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-31 10:08:00',120)),
+(N'LP-SIM-00869',N'Medium',CONVERT(datetime2,N'2026-10-26 14:42:00',120),CONVERT(datetime2,N'2026-10-27 19:42:00',120),CONVERT(datetime2,N'2026-10-27 19:42:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-27 19:42:00',120)),
+(N'LP-SIM-00870',N'Small',CONVERT(datetime2,N'2026-11-05 08:47:00',120),CONVERT(datetime2,N'2026-11-07 08:47:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-07 03:47:00',120)),
+(N'LP-SIM-00871',N'Medium',CONVERT(datetime2,N'2026-10-15 10:24:00',120),CONVERT(datetime2,N'2026-10-16 13:24:00',120),CONVERT(datetime2,N'2026-10-16 13:24:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-16 13:24:00',120)),
+(N'LP-SIM-00872',N'Medium',CONVERT(datetime2,N'2026-11-04 09:36:00',120),CONVERT(datetime2,N'2026-11-08 12:36:00',120),CONVERT(datetime2,N'2026-11-08 12:36:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-08 12:36:00',120)),
+(N'LP-SIM-00873',N'Medium',CONVERT(datetime2,N'2026-10-30 02:46:00',120),CONVERT(datetime2,N'2026-11-01 12:46:00',120),CONVERT(datetime2,N'2026-11-01 12:46:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-11-01 12:46:00',120)),
+(N'LP-SIM-00874',N'Small',CONVERT(datetime2,N'2026-10-17 16:34:00',120),CONVERT(datetime2,N'2026-10-20 16:34:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-20 12:34:00',120)),
+(N'LP-SIM-00875',N'Small',CONVERT(datetime2,N'2026-10-15 08:06:00',120),CONVERT(datetime2,N'2026-10-19 12:06:00',120),CONVERT(datetime2,N'2026-10-19 12:06:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-19 12:06:00',120)),
+(N'LP-SIM-00876',N'Large',CONVERT(datetime2,N'2026-10-27 05:16:00',120),CONVERT(datetime2,N'2026-10-29 05:16:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 04:16:00',120)),
+(N'LP-SIM-00877',N'Medium',CONVERT(datetime2,N'2026-10-30 23:16:00',120),CONVERT(datetime2,N'2026-11-02 23:16:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-02 11:16:00',120)),
+(N'LP-SIM-00878',N'Small',CONVERT(datetime2,N'2026-10-20 19:07:00',120),CONVERT(datetime2,N'2026-10-23 19:07:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-23 16:07:00',120)),
+(N'LP-SIM-00879',N'Large',CONVERT(datetime2,N'2026-10-23 16:15:00',120),CONVERT(datetime2,N'2026-10-27 04:15:00',120),CONVERT(datetime2,N'2026-10-27 04:15:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-27 04:15:00',120)),
+(N'LP-SIM-00880',N'Large',CONVERT(datetime2,N'2026-10-18 01:02:00',120),CONVERT(datetime2,N'2026-10-22 02:02:00',120),CONVERT(datetime2,N'2026-10-22 02:02:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-22 02:02:00',120)),
+(N'LP-SIM-00881',N'Small',CONVERT(datetime2,N'2026-10-15 11:12:00',120),CONVERT(datetime2,N'2026-10-16 23:12:00',120),CONVERT(datetime2,N'2026-10-16 23:12:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-16 23:12:00',120)),
+(N'LP-SIM-00882',N'Medium',CONVERT(datetime2,N'2026-10-20 18:19:00',120),CONVERT(datetime2,N'2026-10-23 21:19:00',120),CONVERT(datetime2,N'2026-10-23 21:19:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-23 21:19:00',120)),
+(N'LP-SIM-00883',N'Small',CONVERT(datetime2,N'2026-11-13 03:57:00',120),CONVERT(datetime2,N'2026-11-15 06:57:00',120),CONVERT(datetime2,N'2026-11-15 06:57:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-15 06:57:00',120)),
+(N'LP-SIM-00884',N'Medium',CONVERT(datetime2,N'2026-10-25 00:31:00',120),CONVERT(datetime2,N'2026-10-29 02:31:00',120),CONVERT(datetime2,N'2026-10-29 02:31:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-10-29 02:31:00',120)),
+(N'LP-SIM-00885',N'Medium',CONVERT(datetime2,N'2026-10-26 16:15:00',120),CONVERT(datetime2,N'2026-10-29 17:15:00',120),CONVERT(datetime2,N'2026-10-29 17:15:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-10-29 17:15:00',120)),
+(N'LP-SIM-00886',N'Medium',CONVERT(datetime2,N'2026-11-11 23:41:00',120),CONVERT(datetime2,N'2026-11-15 05:41:00',120),CONVERT(datetime2,N'2026-11-15 05:41:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-15 05:41:00',120)),
+(N'LP-SIM-00887',N'Medium',CONVERT(datetime2,N'2026-10-18 21:53:00',120),CONVERT(datetime2,N'2026-10-21 21:53:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-21 20:53:00',120)),
+(N'LP-SIM-00888',N'Medium',CONVERT(datetime2,N'2026-11-13 02:58:00',120),CONVERT(datetime2,N'2026-11-17 05:58:00',120),CONVERT(datetime2,N'2026-11-17 05:58:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-17 05:58:00',120)),
+(N'LP-SIM-00889',N'Small',CONVERT(datetime2,N'2026-11-08 18:02:00',120),CONVERT(datetime2,N'2026-11-12 21:02:00',120),CONVERT(datetime2,N'2026-11-12 21:02:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-11-12 21:02:00',120)),
+(N'LP-SIM-00890',N'Medium',CONVERT(datetime2,N'2026-10-17 02:05:00',120),CONVERT(datetime2,N'2026-10-20 07:05:00',120),CONVERT(datetime2,N'2026-10-20 07:05:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-20 07:05:00',120)),
+(N'LP-SIM-00891',N'Small',CONVERT(datetime2,N'2026-11-02 16:42:00',120),CONVERT(datetime2,N'2026-11-03 16:42:00',120),CONVERT(datetime2,N'2026-11-03 16:42:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-08 16:42:00',120)),
+(N'LP-SIM-00892',N'Small',CONVERT(datetime2,N'2026-10-18 16:07:00',120),CONVERT(datetime2,N'2026-10-22 18:07:00',120),CONVERT(datetime2,N'2026-10-22 18:07:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-22 18:07:00',120)),
+(N'LP-SIM-00893',N'Medium',CONVERT(datetime2,N'2026-10-25 21:11:00',120),CONVERT(datetime2,N'2026-10-30 05:11:00',120),CONVERT(datetime2,N'2026-10-30 05:11:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-30 05:11:00',120)),
+(N'LP-SIM-00894',N'Large',CONVERT(datetime2,N'2026-11-12 15:27:00',120),CONVERT(datetime2,N'2026-11-17 03:27:00',120),CONVERT(datetime2,N'2026-11-17 03:27:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-17 03:27:00',120)),
+(N'LP-SIM-00895',N'Small',CONVERT(datetime2,N'2026-10-28 13:47:00',120),CONVERT(datetime2,N'2026-10-31 23:47:00',120),CONVERT(datetime2,N'2026-10-31 23:47:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-10-31 23:47:00',120)),
+(N'LP-SIM-00896',N'Small',CONVERT(datetime2,N'2026-10-24 12:46:00',120),CONVERT(datetime2,N'2026-10-25 12:46:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-25 05:46:00',120)),
+(N'LP-SIM-00897',N'Small',CONVERT(datetime2,N'2026-10-15 19:32:00',120),CONVERT(datetime2,N'2026-10-18 02:32:00',120),CONVERT(datetime2,N'2026-10-18 02:32:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-18 02:32:00',120)),
+(N'LP-SIM-00898',N'Large',CONVERT(datetime2,N'2026-10-31 12:38:00',120),CONVERT(datetime2,N'2026-11-04 20:38:00',120),CONVERT(datetime2,N'2026-11-04 20:38:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-04 20:38:00',120)),
+(N'LP-SIM-00899',N'Medium',CONVERT(datetime2,N'2026-11-01 10:05:00',120),CONVERT(datetime2,N'2026-11-03 10:05:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-03 05:05:00',120)),
+(N'LP-SIM-00900',N'Small',CONVERT(datetime2,N'2026-11-11 12:18:00',120),CONVERT(datetime2,N'2026-11-13 22:18:00',120),CONVERT(datetime2,N'2026-11-13 22:18:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-13 22:18:00',120));
+
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00901',N'Small',CONVERT(datetime2,N'2026-11-12 15:55:00',120),CONVERT(datetime2,N'2026-11-14 16:55:00',120),CONVERT(datetime2,N'2026-11-14 16:55:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-14 16:55:00',120)),
+(N'LP-SIM-00902',N'Medium',CONVERT(datetime2,N'2026-11-07 03:55:00',120),CONVERT(datetime2,N'2026-11-10 12:55:00',120),CONVERT(datetime2,N'2026-11-10 12:55:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-11-10 12:55:00',120)),
+(N'LP-SIM-00903',N'Small',CONVERT(datetime2,N'2026-11-13 06:48:00',120),CONVERT(datetime2,N'2026-11-15 13:48:00',120),CONVERT(datetime2,N'2026-11-15 13:48:00',120),NULL,N'AtLocker',30,5,CONVERT(datetime2,N'2026-11-15 13:48:00',120)),
+(N'LP-SIM-00904',N'Medium',CONVERT(datetime2,N'2026-10-31 15:23:00',120),CONVERT(datetime2,N'2026-11-02 21:23:00',120),CONVERT(datetime2,N'2026-11-02 21:23:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-11-02 21:23:00',120)),
+(N'LP-SIM-00905',N'Large',CONVERT(datetime2,N'2026-11-09 00:12:00',120),CONVERT(datetime2,N'2026-11-10 09:12:00',120),CONVERT(datetime2,N'2026-11-10 09:12:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-11-10 09:12:00',120)),
+(N'LP-SIM-00906',N'Small',CONVERT(datetime2,N'2026-10-17 08:11:00',120),CONVERT(datetime2,N'2026-10-19 08:11:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-10-19 07:11:00',120)),
+(N'LP-SIM-00907',N'Small',CONVERT(datetime2,N'2026-10-23 20:31:00',120),CONVERT(datetime2,N'2026-10-27 22:31:00',120),CONVERT(datetime2,N'2026-10-27 22:31:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-27 22:31:00',120)),
+(N'LP-SIM-00908',N'Small',CONVERT(datetime2,N'2026-10-22 14:56:00',120),CONVERT(datetime2,N'2026-10-25 18:56:00',120),CONVERT(datetime2,N'2026-10-25 18:56:00',120),NULL,N'AtLocker',10,2,CONVERT(datetime2,N'2026-10-25 18:56:00',120)),
+(N'LP-SIM-00909',N'Medium',CONVERT(datetime2,N'2026-10-22 03:42:00',120),CONVERT(datetime2,N'2026-10-26 05:42:00',120),CONVERT(datetime2,N'2026-10-26 05:42:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-26 05:42:00',120)),
+(N'LP-SIM-00910',N'Medium',CONVERT(datetime2,N'2026-10-23 16:27:00',120),CONVERT(datetime2,N'2026-10-27 16:27:00',120),CONVERT(datetime2,N'2026-10-27 16:27:00',120),CONVERT(datetime2,N'2026-10-28 13:27:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-28 13:27:00',120)),
+(N'LP-SIM-00911',N'Small',CONVERT(datetime2,N'2026-11-04 01:02:00',120),CONVERT(datetime2,N'2026-11-05 01:02:00',120),CONVERT(datetime2,N'2026-11-05 01:02:00',120),CONVERT(datetime2,N'2026-11-05 12:02:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-05 12:02:00',120)),
+(N'LP-SIM-00912',N'Small',CONVERT(datetime2,N'2026-11-02 17:38:00',120),CONVERT(datetime2,N'2026-11-05 03:38:00',120),CONVERT(datetime2,N'2026-11-05 03:38:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-11-05 03:38:00',120)),
+(N'LP-SIM-00913',N'Large',CONVERT(datetime2,N'2026-11-12 21:58:00',120),CONVERT(datetime2,N'2026-11-16 06:58:00',120),CONVERT(datetime2,N'2026-11-16 06:58:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-16 06:58:00',120)),
+(N'LP-SIM-00914',N'Small',CONVERT(datetime2,N'2026-10-20 14:35:00',120),CONVERT(datetime2,N'2026-10-22 23:35:00',120),CONVERT(datetime2,N'2026-10-22 23:35:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-22 23:35:00',120)),
+(N'LP-SIM-00915',N'Small',CONVERT(datetime2,N'2026-10-23 07:16:00',120),CONVERT(datetime2,N'2026-10-26 08:16:00',120),CONVERT(datetime2,N'2026-10-26 08:16:00',120),NULL,N'AtLocker',13,3,CONVERT(datetime2,N'2026-10-26 08:16:00',120)),
+(N'LP-SIM-00916',N'Medium',CONVERT(datetime2,N'2026-10-20 10:07:00',120),CONVERT(datetime2,N'2026-10-21 18:07:00',120),CONVERT(datetime2,N'2026-10-21 18:07:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-10-21 18:07:00',120)),
+(N'LP-SIM-00917',N'Small',CONVERT(datetime2,N'2026-11-05 19:03:00',120),CONVERT(datetime2,N'2026-11-10 01:03:00',120),CONVERT(datetime2,N'2026-11-10 01:03:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-10 01:03:00',120)),
+(N'LP-SIM-00918',N'Medium',CONVERT(datetime2,N'2026-11-04 19:40:00',120),CONVERT(datetime2,N'2026-11-08 06:40:00',120),CONVERT(datetime2,N'2026-11-08 06:40:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-08 06:40:00',120)),
+(N'LP-SIM-00919',N'Small',CONVERT(datetime2,N'2026-11-05 23:21:00',120),CONVERT(datetime2,N'2026-11-07 23:21:00',120),CONVERT(datetime2,N'2026-11-07 23:21:00',120),NULL,N'AtLocker',25,1,CONVERT(datetime2,N'2026-11-07 23:21:00',120)),
+(N'LP-SIM-00920',N'Medium',CONVERT(datetime2,N'2026-10-19 03:52:00',120),CONVERT(datetime2,N'2026-10-21 14:52:00',120),CONVERT(datetime2,N'2026-10-21 14:52:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-21 14:52:00',120)),
+(N'LP-SIM-00921',N'Large',CONVERT(datetime2,N'2026-11-05 06:40:00',120),CONVERT(datetime2,N'2026-11-06 07:40:00',120),CONVERT(datetime2,N'2026-11-06 07:40:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-06 07:40:00',120)),
+(N'LP-SIM-00922',N'Medium',CONVERT(datetime2,N'2026-10-26 17:21:00',120),CONVERT(datetime2,N'2026-10-29 17:21:00',120),CONVERT(datetime2,N'2026-10-29 17:21:00',120),CONVERT(datetime2,N'2026-10-30 19:21:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-10-30 19:21:00',120)),
+(N'LP-SIM-00923',N'Small',CONVERT(datetime2,N'2026-10-23 09:14:00',120),CONVERT(datetime2,N'2026-10-24 09:14:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-23 21:14:00',120)),
+(N'LP-SIM-00924',N'Medium',CONVERT(datetime2,N'2026-10-26 22:49:00',120),CONVERT(datetime2,N'2026-10-29 06:49:00',120),CONVERT(datetime2,N'2026-10-29 06:49:00',120),NULL,N'AtLocker',17,4,CONVERT(datetime2,N'2026-10-29 06:49:00',120)),
+(N'LP-SIM-00925',N'Medium',CONVERT(datetime2,N'2026-10-20 22:49:00',120),CONVERT(datetime2,N'2026-10-23 02:49:00',120),CONVERT(datetime2,N'2026-10-23 02:49:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-10-23 02:49:00',120)),
+(N'LP-SIM-00926',N'Large',CONVERT(datetime2,N'2026-10-15 21:23:00',120),CONVERT(datetime2,N'2026-10-19 21:23:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-19 17:23:00',120)),
+(N'LP-SIM-00927',N'Medium',CONVERT(datetime2,N'2026-10-23 15:42:00',120),CONVERT(datetime2,N'2026-10-27 15:42:00',120),CONVERT(datetime2,N'2026-10-27 15:42:00',120),CONVERT(datetime2,N'2026-10-29 20:42:00',120),N'Collected',NULL,5,CONVERT(datetime2,N'2026-10-29 20:42:00',120)),
+(N'LP-SIM-00928',N'Medium',CONVERT(datetime2,N'2026-11-11 14:17:00',120),CONVERT(datetime2,N'2026-11-13 20:17:00',120),CONVERT(datetime2,N'2026-11-13 20:17:00',120),NULL,N'AtLocker',3,1,CONVERT(datetime2,N'2026-11-13 20:17:00',120)),
+(N'LP-SIM-00929',N'Small',CONVERT(datetime2,N'2026-10-18 14:51:00',120),CONVERT(datetime2,N'2026-10-21 15:51:00',120),CONVERT(datetime2,N'2026-10-21 15:51:00',120),NULL,N'AtLocker',12,2,CONVERT(datetime2,N'2026-10-21 15:51:00',120)),
+(N'LP-SIM-00930',N'Small',CONVERT(datetime2,N'2026-10-20 11:49:00',120),CONVERT(datetime2,N'2026-10-22 17:49:00',120),CONVERT(datetime2,N'2026-10-22 17:49:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-22 17:49:00',120)),
+(N'LP-SIM-00931',N'Small',CONVERT(datetime2,N'2026-11-06 10:09:00',120),CONVERT(datetime2,N'2026-11-10 20:09:00',120),CONVERT(datetime2,N'2026-11-10 20:09:00',120),NULL,N'AtLocker',29,4,CONVERT(datetime2,N'2026-11-10 20:09:00',120)),
+(N'LP-SIM-00932',N'Medium',CONVERT(datetime2,N'2026-10-30 11:07:00',120),CONVERT(datetime2,N'2026-11-03 11:07:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-03 09:07:00',120)),
+(N'LP-SIM-00933',N'Small',CONVERT(datetime2,N'2026-11-01 04:00:00',120),CONVERT(datetime2,N'2026-11-05 08:00:00',120),CONVERT(datetime2,N'2026-11-05 08:00:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-05 08:00:00',120)),
+(N'LP-SIM-00934',N'Small',CONVERT(datetime2,N'2026-11-04 18:17:00',120),CONVERT(datetime2,N'2026-11-08 19:17:00',120),CONVERT(datetime2,N'2026-11-08 19:17:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-08 19:17:00',120)),
+(N'LP-SIM-00935',N'Small',CONVERT(datetime2,N'2026-10-21 08:40:00',120),CONVERT(datetime2,N'2026-10-24 17:40:00',120),CONVERT(datetime2,N'2026-10-24 17:40:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-10-24 17:40:00',120)),
+(N'LP-SIM-00936',N'Large',CONVERT(datetime2,N'2026-11-10 11:39:00',120),CONVERT(datetime2,N'2026-11-11 20:39:00',120),CONVERT(datetime2,N'2026-11-11 20:39:00',120),NULL,N'AtLocker',27,2,CONVERT(datetime2,N'2026-11-11 20:39:00',120)),
+(N'LP-SIM-00937',N'Small',CONVERT(datetime2,N'2026-11-10 04:42:00',120),CONVERT(datetime2,N'2026-11-13 11:42:00',120),CONVERT(datetime2,N'2026-11-13 11:42:00',120),NULL,N'AtLocker',14,3,CONVERT(datetime2,N'2026-11-13 11:42:00',120)),
+(N'LP-SIM-00938',N'Medium',CONVERT(datetime2,N'2026-10-22 17:30:00',120),CONVERT(datetime2,N'2026-10-25 23:30:00',120),CONVERT(datetime2,N'2026-10-25 23:30:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-10-25 23:30:00',120)),
+(N'LP-SIM-00939',N'Medium',CONVERT(datetime2,N'2026-11-04 15:39:00',120),CONVERT(datetime2,N'2026-11-05 22:39:00',120),CONVERT(datetime2,N'2026-11-05 22:39:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-05 22:39:00',120)),
+(N'LP-SIM-00940',N'Small',CONVERT(datetime2,N'2026-10-28 22:05:00',120),CONVERT(datetime2,N'2026-11-01 04:05:00',120),CONVERT(datetime2,N'2026-11-01 04:05:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-01 04:05:00',120)),
+(N'LP-SIM-00941',N'Medium',CONVERT(datetime2,N'2026-11-13 06:28:00',120),CONVERT(datetime2,N'2026-11-17 09:28:00',120),CONVERT(datetime2,N'2026-11-17 09:28:00',120),NULL,N'AtLocker',21,5,CONVERT(datetime2,N'2026-11-17 09:28:00',120)),
+(N'LP-SIM-00942',N'Small',CONVERT(datetime2,N'2026-10-16 13:50:00',120),CONVERT(datetime2,N'2026-10-20 18:50:00',120),CONVERT(datetime2,N'2026-10-20 18:50:00',120),NULL,N'AtLocker',1,1,CONVERT(datetime2,N'2026-10-20 18:50:00',120)),
+(N'LP-SIM-00943',N'Medium',CONVERT(datetime2,N'2026-11-09 08:27:00',120),CONVERT(datetime2,N'2026-11-10 11:27:00',120),CONVERT(datetime2,N'2026-11-10 11:27:00',120),NULL,N'AtLocker',4,1,CONVERT(datetime2,N'2026-11-10 11:27:00',120)),
+(N'LP-SIM-00944',N'Medium',CONVERT(datetime2,N'2026-11-08 03:36:00',120),CONVERT(datetime2,N'2026-11-12 03:36:00',120),CONVERT(datetime2,N'2026-11-12 03:36:00',120),NULL,N'AtLocker',23,5,CONVERT(datetime2,N'2026-11-12 03:36:00',120)),
+(N'LP-SIM-00945',N'Medium',CONVERT(datetime2,N'2026-11-08 05:18:00',120),CONVERT(datetime2,N'2026-11-11 08:18:00',120),CONVERT(datetime2,N'2026-11-11 08:18:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-11 08:18:00',120)),
+(N'LP-SIM-00946',N'Medium',CONVERT(datetime2,N'2026-11-02 12:39:00',120),CONVERT(datetime2,N'2026-11-03 12:39:00',120),CONVERT(datetime2,N'2026-11-03 12:39:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-07 12:39:00',120)),
+(N'LP-SIM-00947',N'Small',CONVERT(datetime2,N'2026-10-21 02:27:00',120),CONVERT(datetime2,N'2026-10-22 10:27:00',120),CONVERT(datetime2,N'2026-10-22 10:27:00',120),NULL,N'AtLocker',19,4,CONVERT(datetime2,N'2026-10-22 10:27:00',120)),
+(N'LP-SIM-00948',N'Large',CONVERT(datetime2,N'2026-10-28 16:12:00',120),CONVERT(datetime2,N'2026-11-01 21:12:00',120),CONVERT(datetime2,N'2026-11-01 21:12:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-01 21:12:00',120)),
+(N'LP-SIM-00949',N'Small',CONVERT(datetime2,N'2026-10-30 03:39:00',120),CONVERT(datetime2,N'2026-10-31 15:39:00',120),CONVERT(datetime2,N'2026-10-31 15:39:00',120),NULL,N'AtLocker',22,5,CONVERT(datetime2,N'2026-10-31 15:39:00',120)),
+(N'LP-SIM-00950',N'Small',CONVERT(datetime2,N'2026-10-23 16:51:00',120),CONVERT(datetime2,N'2026-10-28 02:51:00',120),CONVERT(datetime2,N'2026-10-28 02:51:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-10-28 02:51:00',120)),
+(N'LP-SIM-00951',N'Small',CONVERT(datetime2,N'2026-11-12 18:53:00',120),CONVERT(datetime2,N'2026-11-15 01:53:00',120),CONVERT(datetime2,N'2026-11-15 01:53:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-11-15 01:53:00',120)),
+(N'LP-SIM-00952',N'Small',CONVERT(datetime2,N'2026-11-08 16:10:00',120),CONVERT(datetime2,N'2026-11-09 16:10:00',120),CONVERT(datetime2,N'2026-11-09 16:10:00',120),CONVERT(datetime2,N'2026-11-11 21:10:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-11 21:10:00',120)),
+(N'LP-SIM-00953',N'Large',CONVERT(datetime2,N'2026-10-15 13:41:00',120),CONVERT(datetime2,N'2026-10-19 13:41:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-19 03:41:00',120)),
+(N'LP-SIM-00954',N'Medium',CONVERT(datetime2,N'2026-11-05 06:16:00',120),CONVERT(datetime2,N'2026-11-06 06:16:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-05 19:16:00',120)),
+(N'LP-SIM-00955',N'Small',CONVERT(datetime2,N'2026-11-02 12:12:00',120),CONVERT(datetime2,N'2026-11-05 19:12:00',120),CONVERT(datetime2,N'2026-11-05 19:12:00',120),NULL,N'AtLocker',6,1,CONVERT(datetime2,N'2026-11-05 19:12:00',120)),
+(N'LP-SIM-00956',N'Small',CONVERT(datetime2,N'2026-10-25 17:47:00',120),CONVERT(datetime2,N'2026-10-27 17:47:00',120),CONVERT(datetime2,N'2026-10-27 17:47:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-10-27 17:47:00',120)),
+(N'LP-SIM-00957',N'Small',CONVERT(datetime2,N'2026-11-10 03:25:00',120),CONVERT(datetime2,N'2026-11-12 03:25:00',120),CONVERT(datetime2,N'2026-11-12 03:25:00',120),CONVERT(datetime2,N'2026-11-14 08:25:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-14 08:25:00',120)),
+(N'LP-SIM-00958',N'Small',CONVERT(datetime2,N'2026-11-10 05:28:00',120),CONVERT(datetime2,N'2026-11-14 14:28:00',120),CONVERT(datetime2,N'2026-11-14 14:28:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-14 14:28:00',120)),
+(N'LP-SIM-00959',N'Medium',CONVERT(datetime2,N'2026-10-30 04:56:00',120),CONVERT(datetime2,N'2026-11-01 09:56:00',120),CONVERT(datetime2,N'2026-11-01 09:56:00',120),NULL,N'AtLocker',26,1,CONVERT(datetime2,N'2026-11-01 09:56:00',120)),
+(N'LP-SIM-00960',N'Small',CONVERT(datetime2,N'2026-10-22 17:34:00',120),CONVERT(datetime2,N'2026-10-25 21:34:00',120),CONVERT(datetime2,N'2026-10-25 21:34:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-25 21:34:00',120)),
+(N'LP-SIM-00961',N'Medium',CONVERT(datetime2,N'2026-10-28 08:16:00',120),CONVERT(datetime2,N'2026-10-30 08:16:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-29 21:16:00',120)),
+(N'LP-SIM-00962',N'Large',CONVERT(datetime2,N'2026-11-03 21:06:00',120),CONVERT(datetime2,N'2026-11-05 21:06:00',120),CONVERT(datetime2,N'2026-11-05 21:06:00',120),CONVERT(datetime2,N'2026-11-07 11:06:00',120),N'Collected',NULL,3,CONVERT(datetime2,N'2026-11-07 11:06:00',120)),
+(N'LP-SIM-00963',N'Medium',CONVERT(datetime2,N'2026-11-05 17:49:00',120),CONVERT(datetime2,N'2026-11-06 17:49:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-06 06:49:00',120)),
+(N'LP-SIM-00964',N'Medium',CONVERT(datetime2,N'2026-10-21 10:59:00',120),CONVERT(datetime2,N'2026-10-25 10:59:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-10-25 02:59:00',120)),
+(N'LP-SIM-00965',N'Medium',CONVERT(datetime2,N'2026-10-19 07:31:00',120),CONVERT(datetime2,N'2026-10-20 07:31:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-10-20 02:31:00',120)),
+(N'LP-SIM-00966',N'Medium',CONVERT(datetime2,N'2026-11-02 06:53:00',120),CONVERT(datetime2,N'2026-11-05 16:53:00',120),CONVERT(datetime2,N'2026-11-05 16:53:00',120),NULL,N'AtLocker',28,3,CONVERT(datetime2,N'2026-11-05 16:53:00',120)),
+(N'LP-SIM-00967',N'Small',CONVERT(datetime2,N'2026-11-09 05:01:00',120),CONVERT(datetime2,N'2026-11-12 05:01:00',120),CONVERT(datetime2,N'2026-11-12 05:01:00',120),CONVERT(datetime2,N'2026-11-13 09:01:00',120),N'Collected',NULL,4,CONVERT(datetime2,N'2026-11-13 09:01:00',120)),
+(N'LP-SIM-00968',N'Medium',CONVERT(datetime2,N'2026-10-16 20:52:00',120),CONVERT(datetime2,N'2026-10-18 03:52:00',120),CONVERT(datetime2,N'2026-10-18 03:52:00',120),NULL,N'AtLocker',15,3,CONVERT(datetime2,N'2026-10-18 03:52:00',120)),
+(N'LP-SIM-00969',N'Small',CONVERT(datetime2,N'2026-11-04 21:53:00',120),CONVERT(datetime2,N'2026-11-07 21:53:00',120),CONVERT(datetime2,N'2026-11-07 21:53:00',120),NULL,N'Returned',NULL,1,CONVERT(datetime2,N'2026-11-12 21:53:00',120)),
+(N'LP-SIM-00970',N'Small',CONVERT(datetime2,N'2026-10-26 08:53:00',120),CONVERT(datetime2,N'2026-10-30 19:53:00',120),CONVERT(datetime2,N'2026-10-30 19:53:00',120),NULL,N'AtLocker',20,4,CONVERT(datetime2,N'2026-10-30 19:53:00',120)),
+(N'LP-SIM-00971',N'Small',CONVERT(datetime2,N'2026-10-17 19:47:00',120),CONVERT(datetime2,N'2026-10-21 03:47:00',120),CONVERT(datetime2,N'2026-10-21 03:47:00',120),NULL,N'AtLocker',5,1,CONVERT(datetime2,N'2026-10-21 03:47:00',120)),
+(N'LP-SIM-00972',N'Large',CONVERT(datetime2,N'2026-10-28 17:18:00',120),CONVERT(datetime2,N'2026-10-29 18:18:00',120),CONVERT(datetime2,N'2026-10-29 18:18:00',120),NULL,N'AtLocker',8,1,CONVERT(datetime2,N'2026-10-29 18:18:00',120)),
+(N'LP-SIM-00973',N'Small',CONVERT(datetime2,N'2026-10-31 00:59:00',120),CONVERT(datetime2,N'2026-11-03 00:59:00',120),CONVERT(datetime2,N'2026-11-03 00:59:00',120),NULL,N'Returned',NULL,5,CONVERT(datetime2,N'2026-11-05 00:59:00',120)),
+(N'LP-SIM-00974',N'Medium',CONVERT(datetime2,N'2026-10-23 12:26:00',120),CONVERT(datetime2,N'2026-10-26 12:26:00',120),CONVERT(datetime2,N'2026-10-26 12:26:00',120),NULL,N'AtLocker',2,1,CONVERT(datetime2,N'2026-10-26 12:26:00',120)),
+(N'LP-SIM-00975',N'Medium',CONVERT(datetime2,N'2026-10-18 10:41:00',120),CONVERT(datetime2,N'2026-10-20 15:41:00',120),CONVERT(datetime2,N'2026-10-20 15:41:00',120),NULL,N'AtLocker',7,1,CONVERT(datetime2,N'2026-10-20 15:41:00',120)),
+(N'LP-SIM-00976',N'Small',CONVERT(datetime2,N'2026-11-12 14:10:00',120),CONVERT(datetime2,N'2026-11-14 18:10:00',120),CONVERT(datetime2,N'2026-11-14 18:10:00',120),NULL,N'AtLocker',11,2,CONVERT(datetime2,N'2026-11-14 18:10:00',120)),
+(N'LP-SIM-00977',N'Small',CONVERT(datetime2,N'2026-10-17 09:50:00',120),CONVERT(datetime2,N'2026-10-21 09:50:00',120),CONVERT(datetime2,N'2026-10-21 09:50:00',120),CONVERT(datetime2,N'2026-10-21 14:50:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-10-21 14:50:00',120)),
+(N'LP-SIM-00978',N'Small',CONVERT(datetime2,N'2026-11-01 15:17:00',120),CONVERT(datetime2,N'2026-11-02 15:17:00',120),CONVERT(datetime2,N'2026-11-02 15:17:00',120),CONVERT(datetime2,N'2026-11-03 09:17:00',120),N'Collected',NULL,1,CONVERT(datetime2,N'2026-11-03 09:17:00',120)),
+(N'LP-SIM-00979',N'Small',CONVERT(datetime2,N'2026-11-08 08:19:00',120),CONVERT(datetime2,N'2026-11-11 08:19:00',120),CONVERT(datetime2,N'2026-11-11 08:19:00',120),NULL,N'Returned',NULL,2,CONVERT(datetime2,N'2026-11-16 08:19:00',120)),
+(N'LP-SIM-00980',N'Medium',CONVERT(datetime2,N'2026-11-13 18:01:00',120),CONVERT(datetime2,N'2026-11-17 18:01:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-17 17:01:00',120)),
+(N'LP-SIM-00981',N'Small',CONVERT(datetime2,N'2026-10-26 20:24:00',120),CONVERT(datetime2,N'2026-10-29 20:24:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-10-29 16:24:00',120)),
+(N'LP-SIM-00982',N'Small',CONVERT(datetime2,N'2026-10-24 12:07:00',120),CONVERT(datetime2,N'2026-10-28 12:07:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-28 09:07:00',120)),
+(N'LP-SIM-00983',N'Medium',CONVERT(datetime2,N'2026-10-18 14:39:00',120),CONVERT(datetime2,N'2026-10-21 14:39:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-10-21 12:39:00',120)),
+(N'LP-SIM-00984',N'Medium',CONVERT(datetime2,N'2026-10-24 05:42:00',120),CONVERT(datetime2,N'2026-10-27 05:42:00',120),CONVERT(datetime2,N'2026-10-27 05:42:00',120),NULL,N'Returned',NULL,3,CONVERT(datetime2,N'2026-11-02 05:42:00',120)),
+(N'LP-SIM-00985',N'Small',CONVERT(datetime2,N'2026-11-04 08:28:00',120),CONVERT(datetime2,N'2026-11-08 12:28:00',120),CONVERT(datetime2,N'2026-11-08 12:28:00',120),NULL,N'AtLocker',16,3,CONVERT(datetime2,N'2026-11-08 12:28:00',120)),
+(N'LP-SIM-00986',N'Medium',CONVERT(datetime2,N'2026-11-09 01:03:00',120),CONVERT(datetime2,N'2026-11-11 09:03:00',120),CONVERT(datetime2,N'2026-11-11 09:03:00',120),NULL,N'AtLocker',9,2,CONVERT(datetime2,N'2026-11-11 09:03:00',120));
+
+
+
+-- Additional 14 synthetic in-transit parcels: completes the 1,000-parcel seed.
+INSERT INTO dbo.Parcel
+(ParcelCode,ParcelSize,CreatedAt,ExpectedDeliveryAt,DeliveredAt,CollectedAt,Status,CurrentLockerID,DestinationRegionID,LastStatusAt)
+VALUES
+(N'LP-SIM-00987',N'Small',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00988',N'Medium',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00989',N'Large',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00990',N'Small',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00991',N'Medium',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00992',N'Large',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,6,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00993',N'Small',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00994',N'Medium',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00995',N'Large',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,3,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00996',N'Small',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,4,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00997',N'Medium',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,5,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-00998',N'Large',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,6,CONVERT(datetime2,N'2026-11-15 08:00:00',120)),
+(N'LP-SIM-00999',N'Small',CONVERT(datetime2,N'2026-11-14 08:00:00',120),CONVERT(datetime2,N'2026-11-16 18:00:00',120),NULL,NULL,N'InTransit',NULL,1,CONVERT(datetime2,N'2026-11-14 08:00:00',120)),
+(N'LP-SIM-01000',N'Medium',CONVERT(datetime2,N'2026-11-15 08:00:00',120),CONVERT(datetime2,N'2026-11-17 18:00:00',120),NULL,NULL,N'InTransit',NULL,2,CONVERT(datetime2,N'2026-11-15 08:00:00',120));
+
+-- Spread a portion of synthetic destinations across the newly explicit Latgale region.
+UPDATE dbo.Parcel
+SET DestinationRegionID = 6
+WHERE ParcelID % 5 = 0;
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00001'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 21:00:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00002'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-31 14:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00003'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-15 22:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00004'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-17 10:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00005'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-14 06:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00006'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-23 06:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00007'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-08 19:33:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00007'),30,NULL,'Collected',CONVERT(datetime2,N'2026-11-09 17:33:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00008'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-28 03:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00009'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-03 20:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00009'),27,NULL,'Collected',CONVERT(datetime2,N'2026-11-04 04:52:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00010'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-31 09:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00011'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-25 02:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00012'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-20 10:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00013'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-26 06:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00014'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 14:48:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00015'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-22 03:49:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00015'),18,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 07:49:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00016'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 12:37:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00017'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-07 13:01:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00018'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 01:54:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00019'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-20 18:03:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00019'),19,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 18:03:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00020'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-21 18:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00021'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-22 17:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00022'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-05 02:26:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00022'),11,NULL,'Collected',CONVERT(datetime2,N'2026-11-05 08:26:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00023'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 10:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00024'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-16 23:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00025'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-23 03:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00026'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-24 10:01:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00027'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 05:10:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00028'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-25 07:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00029'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 02:50:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00030'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-27 10:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00031'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-21 06:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00032'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 00:34:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00033'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-26 15:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00034'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-16 03:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00035'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-01 07:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00036'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-08 18:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00037'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-16 15:35:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00037'),18,NULL,'Collected',CONVERT(datetime2,N'2026-11-19 06:35:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00038'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-27 03:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00039'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-15 16:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00040'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-09 17:23:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00040'),18,NULL,'Collected',CONVERT(datetime2,N'2026-11-09 20:23:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00041'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-03 16:54:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00041'),24,NULL,'Collected',CONVERT(datetime2,N'2026-11-04 02:54:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00042'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-18 06:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00043'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-29 07:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00044'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-06 21:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00045'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-18 01:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00046'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-01 16:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00047'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-13 06:09:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00047'),1,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 13:09:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00048'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-25 20:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00049'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-18 02:04:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00050'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 05:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00051'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-25 20:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00052'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-17 17:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00053'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-21 10:01:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00053'),26,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-24 10:01:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00054'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-27 03:39:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00054'),27,NULL,'Collected',CONVERT(datetime2,N'2026-10-29 12:39:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00055'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-09 12:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00056'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 16:32:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00057'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-15 00:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00058'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-26 13:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00059'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-17 03:38:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00059'),30,NULL,'Collected',CONVERT(datetime2,N'2026-11-19 16:38:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00060'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-26 09:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00061'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 14:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00062'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-24 14:35:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00062'),16,NULL,'Collected',CONVERT(datetime2,N'2026-10-26 01:35:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00063'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-09 05:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00064'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-12 00:48:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00064'),24,NULL,'Collected',CONVERT(datetime2,N'2026-11-12 11:48:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00065'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-01 00:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00066'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 06:58:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00067'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-22 10:45:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00067'),22,NULL,'Collected',CONVERT(datetime2,N'2026-10-23 15:45:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00068'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-11 09:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00069'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-14 17:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00070'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-31 07:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00071'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 11:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00072'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-28 00:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00073'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-29 13:11:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00073'),3,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 13:11:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00074'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-31 09:50:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00075'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 07:21:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00076'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-27 19:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00077'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-14 15:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00078'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-12 07:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00079'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-01 21:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00080'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-07 17:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00081'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-14 03:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00082'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-04 20:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00083'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-24 10:41:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00084'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-28 12:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00085'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-18 11:22:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00086'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-20 00:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00087'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-23 23:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00088'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 03:26:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00089'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-11 04:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00090'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-23 17:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00091'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-05 23:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00092'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-31 00:19:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00092'),16,NULL,'Collected',CONVERT(datetime2,N'2026-11-02 08:19:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00093'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-26 21:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00094'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-03 17:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00095'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 04:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00096'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-15 01:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00097'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-18 12:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00098'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-18 17:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00099'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-03 11:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00100'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-21 13:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00101'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 21:49:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00102'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-29 22:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00103'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 22:21:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00104'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-07 14:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00105'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-10 00:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00106'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-25 05:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00107'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-31 04:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00108'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-06 23:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00108'),17,NULL,'Collected',CONVERT(datetime2,N'2026-11-09 08:42:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00109'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-24 20:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00110'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-16 08:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00111'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-28 22:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00111'),3,NULL,'Collected',CONVERT(datetime2,N'2026-10-31 04:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00112'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-12 11:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00113'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-13 21:59:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00113'),20,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 11:59:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00114'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-02 20:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00115'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 15:34:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00116'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-26 21:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00117'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-11 01:38:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00117'),3,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 23:38:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00118'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-28 05:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00119'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-30 09:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00120'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-20 21:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00121'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-13 08:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00122'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-20 15:45:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00122'),26,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 07:45:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00123'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-08 12:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00124'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-14 13:37:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00125'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 08:02:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00126'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-30 23:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00127'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-24 16:51:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00127'),24,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 12:51:00',120),N'Synthetic collection');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00128'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-30 03:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00129'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 07:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00130'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-14 16:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00131'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-05 23:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00132'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-03 15:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00133'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-24 10:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00134'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-21 03:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00135'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-20 00:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00136'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-26 03:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00137'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 09:27:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00138'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-11 05:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00139'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-21 21:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00140'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-19 23:25:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00140'),23,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 22:25:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00141'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-10 13:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00142'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-09 19:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00143'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-04 21:29:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00143'),13,NULL,'Collected',CONVERT(datetime2,N'2026-11-05 16:29:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00144'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-22 03:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00145'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-27 00:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00146'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-07 15:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00147'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 04:38:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00148'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-31 07:47:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00149'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-10 12:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00150'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-29 20:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00150'),8,NULL,'Collected',CONVERT(datetime2,N'2026-10-30 14:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00151'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-23 06:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00152'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-08 20:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00153'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-11 13:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00154'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-28 03:01:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00154'),26,NULL,'Collected',CONVERT(datetime2,N'2026-10-30 19:01:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00155'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-22 17:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00156'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-23 21:20:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00156'),20,NULL,'Collected',CONVERT(datetime2,N'2026-10-24 01:20:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00157'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-09 07:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00158'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-16 17:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00159'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-28 12:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00160'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-03 10:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00161'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-04 04:35:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00162'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-12 16:55:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00162'),14,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 14:55:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00163'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-19 17:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00164'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-01 22:05:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00164'),19,NULL,'Collected',CONVERT(datetime2,N'2026-11-02 13:05:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00165'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-28 12:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00166'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-23 09:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00167'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-30 09:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00168'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-31 19:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00169'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 15:38:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00170'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-31 09:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00171'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-05 23:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00172'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-30 08:43:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00173'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 13:52:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00174'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-27 16:49:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00174'),6,NULL,'Collected',CONVERT(datetime2,N'2026-10-28 12:49:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00175'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-03 19:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00176'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-11 17:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00177'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-26 00:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00178'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-12 08:37:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00179'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 08:14:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00180'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 11:18:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00181'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-17 13:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00182'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-24 13:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00183'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-10 04:29:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00183'),28,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 16:29:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00184'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 13:25:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00185'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-02 12:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00186'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-18 11:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00187'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-10 00:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00188'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 18:43:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00189'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-25 06:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00190'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-29 18:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00191'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-13 15:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00192'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-05 02:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00193'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-12 22:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00194'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-31 10:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00195'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-13 19:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00195'),12,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 09:52:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00196'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-30 20:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00197'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-16 16:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00198'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-08 14:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00199'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 02:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00200'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-13 16:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00201'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-26 20:12:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00201'),27,NULL,'Collected',CONVERT(datetime2,N'2026-10-28 14:12:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00202'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-21 19:48:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00202'),19,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 20:48:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00203'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-24 04:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00204'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-22 18:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00205'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-16 12:49:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00206'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-22 11:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00207'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-08 21:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00208'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-17 16:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00209'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-21 13:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00210'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-19 11:21:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00210'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 05:21:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00211'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-23 06:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00212'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-09 13:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00213'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-27 16:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00214'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-07 05:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00215'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-04 06:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00216'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-23 07:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00217'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-18 15:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00218'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-14 18:07:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00218'),30,NULL,'Collected',CONVERT(datetime2,N'2026-11-17 02:07:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00219'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-12 12:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00220'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-02 07:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00220'),25,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 07:52:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00221'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-26 23:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00222'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-15 06:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00223'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 09:39:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00224'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-29 09:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00225'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-29 20:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00226'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-11 02:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00227'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-14 13:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00228'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-26 19:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00229'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-04 01:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00230'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-30 03:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00231'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-23 15:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00232'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-02 04:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00233'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-17 21:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00234'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-31 00:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00235'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 01:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00236'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-07 09:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00237'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-28 09:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00238'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-06 18:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00239'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-10 14:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00240'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-15 16:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00240'),14,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-21 16:42:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00241'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-12 14:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00242'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-13 15:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00243'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 00:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00244'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-30 15:46:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00244'),21,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 15:46:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00245'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-04 21:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00246'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-28 14:25:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00246'),29,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-31 14:25:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00247'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 20:53:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00248'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-30 05:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00249'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 18:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00250'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 05:27:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00251'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-19 17:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00252'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-20 09:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00253'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-18 14:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00254'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-25 00:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00255'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-12 19:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00255'),24,NULL,'Collected',CONVERT(datetime2,N'2026-11-15 10:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00256'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-11 22:17:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00256'),18,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 22:17:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00257'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-08 07:20:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00258'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-04 19:49:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00259'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 09:04:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00260'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 20:20:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00261'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-15 01:21:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00261'),5,NULL,'Collected',CONVERT(datetime2,N'2026-11-16 03:21:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00262'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-29 19:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00263'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 09:43:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00264'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-25 05:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00265'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 00:48:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00266'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-12 05:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00267'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-29 19:36:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00267'),9,NULL,'Collected',CONVERT(datetime2,N'2026-11-01 18:36:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00268'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 06:22:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00269'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-08 00:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00270'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-07 07:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00271'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-08 01:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00272'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-17 16:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00273'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 22:13:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00274'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-29 11:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00275'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-06 14:09:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00275'),8,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-13 14:09:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00276'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-21 09:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00277'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-30 06:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00278'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-19 15:41:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00278'),2,NULL,'Collected',CONVERT(datetime2,N'2026-10-20 13:41:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00279'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-05 22:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00280'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-31 20:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00281'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-06 14:34:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00281'),4,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-13 14:34:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00282'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-28 11:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00283'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-29 22:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00284'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-13 02:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00284'),27,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-20 02:42:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00285'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-29 14:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00286'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-09 17:41:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00286'),30,NULL,'Collected',CONVERT(datetime2,N'2026-11-12 12:41:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00287'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-19 00:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00288'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-25 02:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00289'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-09 00:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00290'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-24 09:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00291'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-02 20:29:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00291'),29,NULL,'Collected',CONVERT(datetime2,N'2026-11-03 17:29:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00292'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-23 07:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00293'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-28 10:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00294'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-24 04:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00295'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-16 04:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00295'),2,NULL,'Collected',CONVERT(datetime2,N'2026-11-18 08:42:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00296'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 18:39:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00297'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-31 21:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00298'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-01 12:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00299'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-09 05:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00300'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-20 13:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00301'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-09 09:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00302'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-03 05:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00303'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-01 01:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00304'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-02 10:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00305'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-25 10:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00306'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 16:56:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00307'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-02 18:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00308'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-12 07:33:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00308'),22,NULL,'Collected',CONVERT(datetime2,N'2026-11-15 07:33:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00309'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 20:52:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00310'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-19 15:15:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00310'),24,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 15:15:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00311'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-28 02:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00312'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-27 02:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00313'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-31 20:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00314'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 09:15:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00315'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 01:02:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00316'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-26 03:46:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00316'),28,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 03:46:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00317'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-02 19:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00318'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-08 09:37:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00319'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-16 04:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00320'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-12 09:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00321'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-09 09:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00322'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-18 02:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00323'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 14:00:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00324'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-29 06:37:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00325'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-30 15:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00326'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 00:36:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00327'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-21 17:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00328'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-04 02:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00329'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-04 04:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00330'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-08 10:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00331'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-19 17:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00332'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-06 15:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00333'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-27 19:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00334'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 22:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00335'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-28 07:41:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00335'),16,NULL,'Collected',CONVERT(datetime2,N'2026-10-31 07:41:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00336'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 21:26:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00337'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-14 11:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00338'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-30 01:18:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00338'),20,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-04 01:18:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00339'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-12 08:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00340'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-09 17:57:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00340'),21,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 17:57:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00341'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-14 15:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00342'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-06 09:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00343'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-02 17:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00344'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-23 00:48:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00344'),6,NULL,'Collected',CONVERT(datetime2,N'2026-10-24 18:48:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00345'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-09 23:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00346'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-07 13:53:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00346'),25,NULL,'Collected',CONVERT(datetime2,N'2026-11-09 00:53:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00347'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-17 10:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00348'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-08 06:06:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00348'),3,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 02:06:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00349'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-24 06:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00350'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-09 04:47:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00350'),19,NULL,'Collected',CONVERT(datetime2,N'2026-11-10 08:47:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00351'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-04 03:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00352'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-27 15:52:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00353'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-06 11:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00354'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-22 06:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00355'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-07 05:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00356'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-30 12:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00357'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-13 08:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00358'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-09 11:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00359'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-16 21:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00360'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-21 14:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00361'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-04 14:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00362'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-26 03:34:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00363'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-28 21:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00364'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-06 17:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00365'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-08 12:58:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00365'),6,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 12:58:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00366'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 01:39:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00367'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-11 10:12:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00367'),22,NULL,'Collected',CONVERT(datetime2,N'2026-11-12 18:12:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00368'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 05:56:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00369'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-04 20:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00370'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-02 19:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00371'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-13 20:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00372'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-07 20:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00373'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-14 15:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00374'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-29 11:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00375'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-24 19:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00376'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-01 22:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00377'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-25 17:32:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00377'),3,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 19:32:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00378'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-12 11:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00379'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-07 08:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00380'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-20 12:03:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00380'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 18:03:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00381'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-31 20:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00382'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-11 10:15:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00382'),16,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 10:15:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00383'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-17 21:19:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00384'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-14 07:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00385'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 22:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00386'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-22 15:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00387'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-21 13:20:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00388'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-15 05:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00389'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-01 06:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00390'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-31 07:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00391'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-20 08:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00392'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-20 00:15:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00392'),25,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 04:15:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00393'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 12:03:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00394'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-31 18:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00395'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-22 20:08:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00396'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-11 19:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00397'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-25 17:21:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00397'),22,NULL,'Collected',CONVERT(datetime2,N'2026-10-28 01:21:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00398'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-12 06:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00399'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-20 01:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00400'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-20 18:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00401'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-31 16:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00402'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-22 09:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00403'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-25 02:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00404'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-11 19:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00405'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-31 13:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00406'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-29 22:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00407'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-24 04:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00408'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-21 08:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00409'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-27 17:20:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00410'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-03 08:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00411'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-09 06:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00412'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-21 04:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00413'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-18 11:17:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00413'),11,NULL,'Collected',CONVERT(datetime2,N'2026-10-19 03:17:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00414'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-03 05:45:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00414'),2,NULL,'Collected',CONVERT(datetime2,N'2026-11-03 15:45:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00415'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-15 14:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00416'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-13 15:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00417'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 19:50:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00418'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-09 08:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00419'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-31 16:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00420'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-09 05:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00421'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-14 08:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00422'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-24 03:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00423'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-08 21:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00424'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 15:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00425'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-10 09:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00426'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-11 14:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00427'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-09 21:56:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00427'),16,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 03:56:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00428'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 09:19:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00429'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-12 00:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00430'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-15 02:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00431'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-31 13:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00432'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-17 00:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00433'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-23 08:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00434'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-03 21:41:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00434'),14,NULL,'Collected',CONVERT(datetime2,N'2026-11-05 13:41:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00435'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-25 01:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00436'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-19 07:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00437'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-26 18:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00438'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 10:45:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00439'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-26 21:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00440'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-28 21:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00441'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-13 19:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00442'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-13 03:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00443'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-21 15:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00444'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 19:26:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00445'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-24 19:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00446'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-09 01:05:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00446'),28,NULL,'Collected',CONVERT(datetime2,N'2026-11-10 13:05:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00447'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-05 02:10:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00447'),29,NULL,'Collected',CONVERT(datetime2,N'2026-11-07 18:10:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00448'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 19:28:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00449'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-28 19:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00450'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-15 08:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00451'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-26 08:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00452'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-24 12:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00453'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-09 17:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00454'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-17 22:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00455'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-07 11:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00456'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-21 08:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00457'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-30 12:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00458'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-28 12:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00459'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-13 00:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00460'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-28 18:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00461'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-17 07:35:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00462'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-10 12:33:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00462'),24,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 12:33:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00463'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-13 06:33:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00464'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-04 17:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00465'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-10 21:56:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00465'),23,NULL,'Collected',CONVERT(datetime2,N'2026-11-12 01:56:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00466'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-01 10:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00467'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-23 23:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00468'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-04 13:54:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00468'),2,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 13:54:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00469'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-04 15:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00470'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 04:09:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00471'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-27 07:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00472'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-07 17:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00473'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-01 23:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00474'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-18 02:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00475'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-16 08:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00476'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 10:27:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00477'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 07:27:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00478'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-18 11:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00478'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-18 18:52:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00479'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-02 13:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00480'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-08 02:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00481'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 10:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00482'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-26 11:22:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00483'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-05 15:17:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00483'),9,NULL,'Collected',CONVERT(datetime2,N'2026-11-07 22:17:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00484'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-06 21:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00485'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-31 01:01:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00486'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-29 04:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00487'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-31 02:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00488'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-20 21:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00489'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-27 19:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00490'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-15 23:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00491'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-02 13:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00492'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 03:33:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00493'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-30 05:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00494'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 23:29:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00495'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 18:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00496'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 15:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00497'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-14 03:07:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00497'),15,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 13:07:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00498'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-31 15:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00499'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-20 14:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00500'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-25 02:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00501'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-09 18:37:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00501'),18,NULL,'Collected',CONVERT(datetime2,N'2026-11-10 17:37:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00502'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-20 17:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00503'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-28 17:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00504'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-30 09:03:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00505'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-06 00:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00506'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-15 12:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00507'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 17:10:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00508'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-06 15:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00509'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-18 19:31:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00509'),13,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 07:31:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00510'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 01:36:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00511'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-30 21:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00512'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-31 20:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00513'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-22 05:40:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00513'),1,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 20:40:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00514'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-18 19:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00515'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-16 12:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00516'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-01 16:26:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00517'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-16 08:10:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00518'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-10 18:43:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00518'),5,NULL,'Collected',CONVERT(datetime2,N'2026-11-12 10:43:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00519'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 09:47:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00520'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-29 19:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00521'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-27 02:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00522'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 14:22:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00523'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-27 15:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00524'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-25 13:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00524'),3,NULL,'Collected',CONVERT(datetime2,N'2026-10-26 23:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00525'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-04 15:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00526'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-17 05:02:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00526'),10,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-22 05:02:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00527'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-04 02:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00528'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-20 03:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00529'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-11 18:14:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00529'),29,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 06:14:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00530'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 15:55:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00531'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-04 07:22:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00531'),1,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 07:22:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00532'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-30 23:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00533'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-10 19:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00534'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-31 06:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00535'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-02 17:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00536'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-23 04:23:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00536'),24,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-27 04:23:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00537'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-24 04:53:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00537'),4,NULL,'Collected',CONVERT(datetime2,N'2026-10-24 16:53:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00538'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-04 14:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00539'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-04 13:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00540'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 14:03:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00541'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-19 20:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00542'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-06 07:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00543'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-14 01:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00544'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-20 02:42:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00545'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 03:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00546'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-15 07:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00547'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-07 17:12:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00547'),27,NULL,'Collected',CONVERT(datetime2,N'2026-11-08 20:12:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00548'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-13 09:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00549'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-29 04:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00550'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-25 16:05:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00550'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 10:05:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00551'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 20:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00552'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-09 08:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00553'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-26 20:57:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00553'),26,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 12:57:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00554'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-02 11:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00555'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-08 01:06:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00555'),10,NULL,'Collected',CONVERT(datetime2,N'2026-11-10 10:06:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00556'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-15 09:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00557'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-28 06:26:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00557'),4,NULL,'Collected',CONVERT(datetime2,N'2026-10-30 13:26:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00558'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-22 12:25:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00559'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-31 06:25:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00559'),21,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 06:25:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00560'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-23 07:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00561'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-04 11:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00562'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-28 13:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00563'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-13 21:45:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00564'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-30 10:48:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00565'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-07 18:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00566'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 07:47:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00567'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-07 09:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00568'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-12 12:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00569'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 09:41:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00570'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-13 12:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00571'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-10 01:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00572'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 09:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00573'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-29 20:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00574'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-03 19:01:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00575'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-22 14:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00576'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-21 20:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00577'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-19 03:05:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00577'),16,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 11:05:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00578'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-26 14:58:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00579'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-10 15:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00580'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-24 18:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00581'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-13 03:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00582'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-11 17:11:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00582'),4,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 20:11:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00583'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 21:06:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00584'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 06:51:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00585'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-17 03:36:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00585'),9,NULL,'Collected',CONVERT(datetime2,N'2026-11-19 22:36:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00586'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 20:15:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00587'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-23 18:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00588'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-23 09:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00589'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-28 09:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00590'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-27 14:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00591'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-28 04:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00592'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-10 10:05:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00592'),13,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 01:05:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00593'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-09 06:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00594'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-01 23:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00595'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-11 00:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00596'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-30 05:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00597'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-05 22:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00598'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-05 06:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00599'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 16:43:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00600'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-13 10:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00601'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-12 04:34:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00601'),11,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-17 04:34:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00602'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-10-24 06:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00603'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-06 16:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00604'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-27 18:35:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00604'),13,NULL,'Collected',CONVERT(datetime2,N'2026-10-28 20:35:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00605'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-15 00:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00605'),19,NULL,'Collected',CONVERT(datetime2,N'2026-11-17 03:52:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00606'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-27 00:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00607'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 03:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00608'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-09 02:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00609'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-10 20:44:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00609'),19,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 12:44:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00610'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-03 07:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00611'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-16 01:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00612'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-17 16:22:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00613'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-17 15:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00614'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-10 11:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00614'),13,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 12:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00615'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-22 01:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00616'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-15 04:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00617'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-08 19:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00618'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-19 22:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00619'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-31 01:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00620'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-04 15:53:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00620'),24,NULL,'Collected',CONVERT(datetime2,N'2026-11-06 07:53:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00621'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-24 12:08:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00621'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-26 05:08:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00622'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-30 05:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00623'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 15:52:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00624'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-01 15:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00625'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-19 04:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00626'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-07 04:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00627'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-16 21:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00628'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-27 03:02:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00628'),14,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 09:02:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00629'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 22:41:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00630'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-23 12:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00631'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-23 21:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00632'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-06 14:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00633'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-16 12:12:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00633'),2,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-19 12:12:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00634'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 09:13:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00635'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-22 06:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00636'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-01 10:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00637'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-23 01:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00638'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-13 06:14:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00639'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-26 02:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00640'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-15 13:22:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00641'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-09 05:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00642'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-25 09:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00643'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-20 13:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00644'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-24 15:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00645'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-26 02:13:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00645'),23,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 02:13:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00646'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-11 15:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00647'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-18 13:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00648'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-25 14:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00648'),10,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 14:50:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00649'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-07 18:01:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00650'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-04 23:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00651'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-17 10:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00652'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-09 23:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00653'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-26 13:32:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00653'),18,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 10:32:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00654'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-25 13:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00655'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 06:32:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00656'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-19 05:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00657'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-06 15:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00658'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-15 19:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00659'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-12 17:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00660'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-09 07:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00661'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-26 23:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00662'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-04 09:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00663'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-01 02:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00664'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-20 09:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00665'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 14:45:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00666'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-15 14:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00667'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-24 02:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00668'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-11 07:58:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00669'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-07 03:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00670'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 08:33:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00671'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-10 22:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00672'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-05 12:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00673'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-24 00:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00674'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-19 13:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00675'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-10 16:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00676'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-09 03:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00677'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 22:01:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00678'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 04:18:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00679'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-29 15:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00680'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-09 00:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00681'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-26 12:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00682'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-25 03:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00683'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-11 12:48:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00684'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-14 06:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00685'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 11:34:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00686'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-12 04:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00687'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-25 20:37:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00687'),29,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 21:37:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00688'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-12 11:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00689'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-13 21:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00690'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-25 04:45:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00691'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-29 18:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00692'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-25 12:06:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00692'),14,NULL,'Collected',CONVERT(datetime2,N'2026-10-27 15:06:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00693'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-22 06:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00694'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-28 22:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00695'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-15 04:43:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00696'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-27 17:53:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00696'),25,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 17:53:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00697'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-28 14:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00698'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-26 15:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00699'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-21 15:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00700'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-30 15:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00701'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 14:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00702'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-27 16:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00703'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-28 18:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00704'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-03 22:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00705'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-11 19:00:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00705'),23,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 11:00:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00706'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-23 08:48:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00706'),23,NULL,'Collected',CONVERT(datetime2,N'2026-10-26 05:48:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00707'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-31 13:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00708'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-11 04:29:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00709'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-26 17:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00710'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-31 16:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00711'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-11 05:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00712'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 14:00:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00713'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 13:37:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00714'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-15 11:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00715'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-17 09:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00716'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-01 19:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00717'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-22 21:50:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00718'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-17 01:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00719'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-30 15:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00720'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 10:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00721'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-06 10:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00722'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-23 10:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00723'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-16 22:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00724'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-16 22:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00725'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-01 12:49:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00725'),28,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 12:49:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00726'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-12 07:35:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00726'),13,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-19 07:35:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00727'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-07 17:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00728'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-06 20:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00729'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-04 21:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00730'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-17 20:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00731'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-23 17:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00732'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-15 00:39:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00732'),3,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-18 00:39:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00733'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-29 07:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00734'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-22 14:40:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00735'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-12 07:04:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00735'),19,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 20:04:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00736'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-08 12:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00737'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-25 10:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00738'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-26 21:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00739'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-04 10:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00740'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-31 21:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00741'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-25 00:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00742'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-20 04:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00743'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-18 06:01:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00743'),15,NULL,'Collected',CONVERT(datetime2,N'2026-10-20 09:01:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00744'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-07 04:04:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00744'),3,NULL,'Collected',CONVERT(datetime2,N'2026-11-08 19:04:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00745'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-02 03:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00746'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-03 22:43:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00746'),6,NULL,'Collected',CONVERT(datetime2,N'2026-11-04 01:43:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00747'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-20 06:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00748'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-07 05:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00749'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-07 15:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00750'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 15:42:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00751'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-31 00:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00752'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-29 19:08:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00752'),11,NULL,'Collected',CONVERT(datetime2,N'2026-10-30 04:08:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00753'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-21 21:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00754'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 18:35:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00755'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-04 00:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00756'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 20:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00757'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-06 16:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00758'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-09 07:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00759'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-20 17:01:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00760'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-22 14:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00761'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-04 13:29:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00762'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-05 06:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00763'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-11 06:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00764'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-14 09:26:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00764'),4,NULL,'Collected',CONVERT(datetime2,N'2026-11-15 12:26:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00765'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-27 04:27:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00766'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-13 17:45:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00766'),22,NULL,'Collected',CONVERT(datetime2,N'2026-11-15 11:45:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00767'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-25 13:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00768'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-01 00:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00769'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-08 03:45:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00769'),7,NULL,'Collected',CONVERT(datetime2,N'2026-11-10 15:45:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00770'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-04 11:03:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00771'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-23 05:01:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00772'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-27 23:49:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00772'),6,NULL,'Collected',CONVERT(datetime2,N'2026-10-29 22:49:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00773'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-10 09:52:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00774'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-08 13:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00775'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-31 08:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00776'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 11:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00777'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 10:01:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00778'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-10-24 23:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00779'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-11 23:11:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00780'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-03 17:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00781'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-15 07:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00782'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-07 08:45:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00783'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-10-21 22:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00784'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-06 04:33:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00785'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-02 10:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00786'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-29 19:20:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00787'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-03 02:43:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00787'),25,NULL,'Collected',CONVERT(datetime2,N'2026-11-06 02:43:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00788'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-19 03:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00789'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-10 16:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00790'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-07 03:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00791'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-15 07:03:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00791'),10,NULL,'Collected',CONVERT(datetime2,N'2026-11-17 04:03:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00792'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-14 09:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00793'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-15 23:14:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00793'),23,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-22 23:14:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00794'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-02 10:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00795'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-11 08:46:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00795'),13,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 10:46:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00796'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-11 20:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00797'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-14 10:08:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00798'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-25 13:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00799'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-01 08:13:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00800'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-11 06:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00801'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-16 21:52:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00801'),6,NULL,'Collected',CONVERT(datetime2,N'2026-11-17 11:52:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00802'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-19 06:39:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00802'),23,NULL,'Collected',CONVERT(datetime2,N'2026-10-20 00:39:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00803'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-02 06:23:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00803'),13,NULL,'Collected',CONVERT(datetime2,N'2026-11-02 11:23:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00804'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-20 17:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00805'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 05:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00806'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-17 09:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00807'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-21 19:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00808'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 18:13:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00809'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-07 02:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00810'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-22 14:25:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00811'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-27 11:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00812'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-10-20 21:33:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00812'),6,NULL,'Collected',CONVERT(datetime2,N'2026-10-22 06:33:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00813'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-11-07 03:44:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00814'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-10-28 15:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00815'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-08 20:22:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00815'),5,NULL,'Collected',CONVERT(datetime2,N'2026-11-09 05:22:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00816'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-20 20:04:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00816'),15,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 03:04:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00817'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-09 17:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00818'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-12 00:04:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00819'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-05 17:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00820'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-02 04:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00821'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 11:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00822'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-31 22:59:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00823'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-16 19:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00824'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-23 23:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00825'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-09 15:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00826'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-11 00:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00827'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-23 07:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00828'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 20:21:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00829'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-13 22:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00830'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-02 14:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00831'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-30 12:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00832'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 03:15:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00833'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-11-03 14:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00834'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-14 11:22:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00835'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-04 00:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00836'),NULL,24,'Loaded',CONVERT(datetime2,N'2026-11-02 01:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00837'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 09:58:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00838'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-30 01:30:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00839'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-26 03:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00840'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-29 20:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00841'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-11-12 12:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00842'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-10-22 20:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00843'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-02 12:09:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00843'),3,NULL,'Collected',CONVERT(datetime2,N'2026-11-04 13:09:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00844'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-26 10:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00845'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-11-11 23:11:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00845'),20,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 16:11:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00846'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 18:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00847'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-10 00:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00848'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-09 19:30:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00849'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-17 20:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00850'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-02 16:46:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00850'),7,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 16:46:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00851'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-26 16:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00852'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-17 04:54:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00853'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-10-30 20:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00854'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-02 17:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00855'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-03 19:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00856'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-05 07:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00857'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-22 10:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00858'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-07 13:43:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00859'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-11-07 15:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00860'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-08 19:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00861'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-07 12:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00862'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-13 00:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00863'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-07 22:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00864'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-28 10:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00865'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-30 14:16:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00865'),12,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-01 14:16:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00866'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-30 15:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00867'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-03 14:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00868'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-31 10:08:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00869'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-27 19:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00870'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-07 03:47:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00871'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-16 13:24:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00872'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-08 12:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00873'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-11-01 12:46:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00874'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-20 12:34:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00875'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-19 12:06:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00876'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 04:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00877'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 11:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00878'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 16:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00879'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-27 04:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00880'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-22 02:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00881'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-16 23:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00882'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-23 21:19:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00883'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-15 06:57:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00884'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-10-29 02:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00885'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-10-29 17:15:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00886'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-15 05:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00887'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-21 20:53:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00888'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-17 05:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00889'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-12 21:02:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00890'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-20 07:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00891'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-03 16:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00891'),7,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-08 16:42:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00892'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-22 18:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00893'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-30 05:11:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00894'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-17 03:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00895'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-10-31 23:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00896'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 05:46:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00897'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-18 02:32:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00898'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-04 20:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00899'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 05:05:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00900'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-13 22:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00901'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-14 16:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00902'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-11-10 12:55:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00903'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-11-15 13:48:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00904'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-11-02 21:23:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00905'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-10 09:12:00',120),N'Synthetic initial locker load');
+
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00906'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 07:11:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00907'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-27 22:31:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00908'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-25 18:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00909'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-26 05:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00910'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-27 16:27:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00910'),28,NULL,'Collected',CONVERT(datetime2,N'2026-10-28 13:27:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00911'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-05 01:02:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00911'),7,NULL,'Collected',CONVERT(datetime2,N'2026-11-05 12:02:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00912'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-11-05 03:38:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00913'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-16 06:58:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00914'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-22 23:35:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00915'),NULL,13,'Loaded',CONVERT(datetime2,N'2026-10-26 08:16:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00916'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-10-21 18:07:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00917'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-10 01:03:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00918'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-08 06:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00919'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-07 23:21:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00920'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-21 14:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00921'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-06 07:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00922'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-29 17:21:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00922'),9,NULL,'Collected',CONVERT(datetime2,N'2026-10-30 19:21:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00923'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-23 21:14:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00924'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-10-29 06:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00925'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-10-23 02:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00926'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 17:23:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00927'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-27 15:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00927'),19,NULL,'Collected',CONVERT(datetime2,N'2026-10-29 20:42:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00928'),NULL,3,'Loaded',CONVERT(datetime2,N'2026-11-13 20:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00929'),NULL,12,'Loaded',CONVERT(datetime2,N'2026-10-21 15:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00930'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-22 17:49:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00931'),NULL,29,'Loaded',CONVERT(datetime2,N'2026-11-10 20:09:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00932'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-03 09:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00933'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-05 08:00:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00934'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-08 19:17:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00935'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-10-24 17:40:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00936'),NULL,27,'Loaded',CONVERT(datetime2,N'2026-11-11 20:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00937'),NULL,14,'Loaded',CONVERT(datetime2,N'2026-11-13 11:42:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00938'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-10-25 23:30:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00939'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-05 22:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00940'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-01 04:05:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00941'),NULL,21,'Loaded',CONVERT(datetime2,N'2026-11-17 09:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00942'),NULL,1,'Loaded',CONVERT(datetime2,N'2026-10-20 18:50:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00943'),NULL,4,'Loaded',CONVERT(datetime2,N'2026-11-10 11:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00944'),NULL,23,'Loaded',CONVERT(datetime2,N'2026-11-12 03:36:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00945'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-11 08:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00946'),NULL,18,'Loaded',CONVERT(datetime2,N'2026-11-03 12:39:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00946'),18,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-07 12:39:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00947'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-10-22 10:27:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00948'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-01 21:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00949'),NULL,22,'Loaded',CONVERT(datetime2,N'2026-10-31 15:39:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00950'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-10-28 02:51:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00951'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-11-15 01:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00952'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-09 16:10:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00952'),6,NULL,'Collected',CONVERT(datetime2,N'2026-11-11 21:10:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00953'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-19 03:41:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00954'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 19:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00955'),NULL,6,'Loaded',CONVERT(datetime2,N'2026-11-05 19:12:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00956'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-10-27 17:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00957'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-12 03:25:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00957'),9,NULL,'Collected',CONVERT(datetime2,N'2026-11-14 08:25:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00958'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-14 14:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00959'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-01 09:56:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00960'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-25 21:34:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00961'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 21:16:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00962'),NULL,17,'Loaded',CONVERT(datetime2,N'2026-11-05 21:06:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00962'),17,NULL,'Collected',CONVERT(datetime2,N'2026-11-07 11:06:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00963'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-06 06:49:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00964'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-25 02:59:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00965'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-20 02:31:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00966'),NULL,28,'Loaded',CONVERT(datetime2,N'2026-11-05 16:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00967'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-11-12 05:01:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00967'),7,NULL,'Collected',CONVERT(datetime2,N'2026-11-13 09:01:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00968'),NULL,15,'Loaded',CONVERT(datetime2,N'2026-10-18 03:52:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00969'),NULL,19,'Loaded',CONVERT(datetime2,N'2026-11-07 21:53:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00969'),19,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-12 21:53:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00970'),NULL,20,'Loaded',CONVERT(datetime2,N'2026-10-30 19:53:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00971'),NULL,5,'Loaded',CONVERT(datetime2,N'2026-10-21 03:47:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00972'),NULL,8,'Loaded',CONVERT(datetime2,N'2026-10-29 18:18:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00973'),NULL,25,'Loaded',CONVERT(datetime2,N'2026-11-03 00:59:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00973'),25,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-05 00:59:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00974'),NULL,2,'Loaded',CONVERT(datetime2,N'2026-10-26 12:26:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00975'),NULL,7,'Loaded',CONVERT(datetime2,N'2026-10-20 15:41:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00976'),NULL,11,'Loaded',CONVERT(datetime2,N'2026-11-14 18:10:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00977'),NULL,10,'Loaded',CONVERT(datetime2,N'2026-10-21 09:50:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00977'),10,NULL,'Collected',CONVERT(datetime2,N'2026-10-21 14:50:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00978'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-02 15:17:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00978'),16,NULL,'Collected',CONVERT(datetime2,N'2026-11-03 09:17:00',120),N'Synthetic collection'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00979'),NULL,26,'Loaded',CONVERT(datetime2,N'2026-11-11 08:19:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00979'),26,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-16 08:19:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00980'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-17 17:01:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00981'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-29 16:24:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00982'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-28 09:07:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00983'),NULL,NULL,'Dispatched',CONVERT(datetime2,N'2026-10-21 12:39:00',120),N'Synthetic parcel in transit'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00984'),NULL,30,'Loaded',CONVERT(datetime2,N'2026-10-27 05:42:00',120),N'Synthetic historical loading'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00984'),30,NULL,'Dispatched',CONVERT(datetime2,N'2026-11-02 05:42:00',120),N'Synthetic return dispatch'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00985'),NULL,16,'Loaded',CONVERT(datetime2,N'2026-11-08 12:28:00',120),N'Synthetic initial locker load'),
+((SELECT ParcelID FROM dbo.Parcel WHERE ParcelCode=N'LP-SIM-00986'),NULL,9,'Loaded',CONVERT(datetime2,N'2026-11-11 09:03:00',120),N'Synthetic initial locker load');
+
+-- Seed 14 days of synthetic operational metrics.
+
+
+
+-- Dispatch history for the 14 additional synthetic in-transit parcels.
+INSERT INTO dbo.ParcelMovement (ParcelID,FromLockerID,ToLockerID,EventType,EventAt,Notes)
+VALUES
+(987,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(988,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(989,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(990,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(991,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(992,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(993,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(994,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(995,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(996,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(997,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(998,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(999,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit'),
+(1000,NULL,NULL,N'Dispatched',CONVERT(datetime2,N'2026-11-14 08:00:00',120),N'Synthetic parcel dispatched and currently in transit');
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-01',9,3,8,10,9);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-02',8,5,8,11,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-03',12,4,10,9,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-04',8,4,10,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-05',13,3,8,8,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-06',9,11,9,11,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-07',7,6,10,12,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-08',12,4,11,8,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-09',5,8,11,8,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-10',14,7,8,10,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-11',4,13,9,10,10);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-12',8,11,12,12,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-13',3,9,11,11,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (1,'2026-11-14',13,2,11,11,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-01',12,5,11,12,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-02',10,8,14,13,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-03',2,9,12,14,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-04',12,10,14,11,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-05',10,3,15,14,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-06',5,9,14,14,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-07',5,11,14,10,9);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-08',6,13,14,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-09',7,11,14,12,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-10',7,6,17,13,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-11',10,6,16,14,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-12',4,2,15,14,9);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-13',4,6,16,14,9);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (2,'2026-11-14',11,5,16,16,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-01',13,11,6,13,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-02',6,12,10,13,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-03',10,4,7,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-04',9,8,10,13,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-05',14,10,9,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-06',3,12,6,14,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-07',9,11,8,11,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-08',7,13,10,13,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-09',9,12,11,13,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-10',2,6,10,15,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-11',7,9,7,11,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-12',5,6,11,14,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-13',11,2,9,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (3,'2026-11-14',4,13,10,15,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-01',12,5,11,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-02',11,12,11,8,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-03',2,13,12,5,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-04',9,8,10,5,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-05',8,12,14,9,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-06',6,6,13,6,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-07',13,6,12,9,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-08',9,6,11,7,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-09',3,4,13,10,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-10',9,10,13,7,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-11',12,12,14,7,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-12',12,6,12,6,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-13',3,6,13,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (4,'2026-11-14',6,13,14,10,8);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-01',12,5,4,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-02',10,10,8,7,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-03',5,4,7,3,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-04',13,9,5,4,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-05',6,5,9,5,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-06',2,5,9,7,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-07',2,12,8,4,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-08',8,4,5,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-09',14,8,5,4,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-10',7,6,6,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-11',4,6,8,3,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-12',10,9,8,7,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-13',14,9,8,7,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (5,'2026-11-14',14,3,10,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-01',14,12,9,9,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-02',13,5,11,7,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-03',2,6,13,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-04',4,10,14,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-05',13,2,12,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-06',9,8,13,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-07',7,6,12,8,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-08',2,5,10,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-09',14,13,11,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-10',4,8,13,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-11',11,4,15,12,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-12',8,6,11,8,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-13',5,7,12,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (6,'2026-11-14',12,2,12,12,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-01',4,13,8,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-02',2,5,11,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-03',13,2,9,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-04',5,3,10,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-05',10,12,10,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-06',14,11,9,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-07',3,13,12,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-08',9,3,8,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-09',10,13,9,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-10',13,13,8,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-11',7,6,11,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-12',8,12,10,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-13',3,3,11,8,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (7,'2026-11-14',11,4,10,11,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-01',13,3,7,2,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-02',10,7,8,2,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-03',8,3,8,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-04',13,12,11,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-05',4,10,10,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-06',12,13,8,5,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-07',7,6,12,4,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-08',11,8,9,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-09',10,8,9,4,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-10',9,12,9,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-11',14,5,11,6,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-12',11,11,10,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-13',3,9,13,5,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (8,'2026-11-14',12,6,10,3,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-01',11,2,5,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-02',11,6,6,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-03',3,8,8,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-04',8,4,5,7,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-05',14,8,8,8,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-06',14,9,7,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-07',11,10,10,8,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-08',11,2,8,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-09',10,11,6,11,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-10',12,4,6,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-11',3,4,7,9,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-12',4,11,7,7,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-13',12,5,10,7,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (9,'2026-11-14',7,9,10,12,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-01',9,12,8,8,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-02',4,6,9,12,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-03',5,5,10,10,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-04',10,11,8,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-05',13,2,12,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-06',10,5,10,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-07',3,10,11,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-08',7,13,10,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-09',2,4,10,11,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-10',3,6,10,10,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-11',11,11,11,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-12',3,6,10,11,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-13',11,2,12,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (10,'2026-11-14',10,11,13,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-01',13,6,5,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-02',11,12,7,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-03',2,8,7,5,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-04',11,11,7,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-05',12,7,4,5,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-06',12,3,7,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-07',8,12,5,10,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-08',5,12,3,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-09',14,12,5,10,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-10',14,12,3,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-11',6,6,6,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-12',11,2,5,7,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-13',9,12,5,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (11,'2026-11-14',12,10,8,8,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-01',3,10,10,9,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-02',4,5,9,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-03',6,13,8,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-04',5,9,9,9,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-05',5,12,7,10,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-06',13,5,9,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-07',12,9,7,11,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-08',11,2,9,11,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-09',13,8,9,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-10',9,10,9,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-11',14,10,9,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-12',6,6,11,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-13',8,5,7,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (12,'2026-11-14',13,9,12,8,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-01',10,9,13,8,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-02',7,11,11,12,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-03',9,6,14,12,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-04',13,10,10,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-05',9,13,14,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-06',11,9,12,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-07',10,11,12,12,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-08',14,2,12,12,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-09',13,5,12,12,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-10',12,3,12,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-11',11,2,15,13,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-12',6,7,13,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-13',4,4,15,12,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (13,'2026-11-14',9,13,14,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-01',4,10,6,5,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-02',7,3,5,8,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-03',4,11,8,7,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-04',3,6,6,8,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-05',12,12,7,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-06',9,9,7,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-07',10,9,8,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-08',8,13,8,7,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-09',14,6,5,8,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-10',4,4,4,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-11',5,7,6,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-12',6,8,6,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-13',5,7,7,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (14,'2026-11-14',4,5,9,7,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-01',4,3,4,5,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-02',6,12,4,3,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-03',12,6,4,3,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-04',2,5,5,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-05',12,12,4,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-06',8,12,5,6,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-07',13,12,2,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-08',10,8,5,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-09',11,2,4,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-10',8,5,5,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-11',9,12,2,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-12',7,3,2,7,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-13',12,10,2,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (15,'2026-11-14',11,7,6,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-01',7,7,2,8,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-02',5,7,6,9,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-03',3,12,3,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-04',9,4,4,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-05',8,13,5,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-06',3,3,3,10,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-07',5,7,5,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-08',14,2,4,10,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-09',2,12,4,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-10',13,7,5,9,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-11',2,6,4,7,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-12',10,12,3,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-13',2,13,4,10,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (16,'2026-11-14',10,3,4,11,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-01',7,4,6,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-02',5,11,8,12,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-03',6,6,5,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-04',9,7,4,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-05',14,7,6,8,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-06',13,13,7,8,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-07',10,4,9,8,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-08',3,13,5,13,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-09',9,2,9,13,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-10',6,4,6,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-11',13,4,8,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-12',8,7,8,11,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-13',3,11,7,13,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (17,'2026-11-14',10,3,8,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-01',4,10,7,4,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-02',10,7,3,4,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-03',13,2,8,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-04',11,6,4,6,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-05',12,11,5,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-06',12,8,8,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-07',7,12,5,2,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-08',2,2,4,3,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-09',14,3,6,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-10',3,2,6,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-11',6,7,7,3,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-12',11,3,5,5,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-13',10,4,6,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (18,'2026-11-14',6,12,8,4,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-01',14,2,7,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-02',12,10,9,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-03',5,13,6,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-04',10,7,7,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-05',4,10,8,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-06',6,8,7,2,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-07',4,9,10,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-08',11,10,7,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-09',7,5,10,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-10',8,3,6,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-11',4,13,10,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-12',7,3,10,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-13',9,11,9,3,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (19,'2026-11-14',5,13,9,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-01',4,3,3,1,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-02',11,11,5,4,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-03',10,3,4,1,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-04',11,2,3,2,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-05',8,9,6,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-06',13,13,2,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-07',7,13,5,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-08',4,6,6,2,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-09',14,5,5,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-10',10,12,6,3,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-11',5,8,4,2,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-12',7,11,2,2,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-13',11,8,5,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (20,'2026-11-14',13,9,3,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-01',10,5,7,10,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-02',3,7,8,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-03',11,7,6,12,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-04',11,2,7,12,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-05',2,6,5,8,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-06',11,9,10,12,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-07',8,11,9,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-08',6,2,7,11,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-09',2,13,10,9,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-10',14,9,10,13,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-11',13,8,10,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-12',6,6,9,10,7);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-13',2,7,7,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (21,'2026-11-14',5,7,8,12,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-01',5,11,7,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-02',7,9,8,3,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-03',3,10,11,5,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-04',2,4,11,3,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-05',2,7,9,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-06',13,9,7,7,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-07',14,11,12,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-08',6,3,10,4,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-09',6,4,11,3,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-10',8,6,9,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-11',3,7,11,4,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-12',7,12,11,4,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-13',4,3,12,4,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (22,'2026-11-14',12,7,9,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-01',7,10,7,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-02',7,5,3,4,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-03',10,11,6,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-04',8,2,5,6,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-05',13,4,5,6,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-06',14,4,6,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-07',7,11,6,3,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-08',2,6,6,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-09',3,8,5,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-10',6,5,5,6,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-11',2,5,6,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-12',8,2,4,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-13',9,5,4,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (23,'2026-11-14',10,12,5,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-01',14,2,3,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-02',13,10,6,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-03',11,5,5,3,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-04',5,5,6,3,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-05',4,12,7,3,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-06',2,13,5,6,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-07',2,3,8,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-08',8,4,5,3,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-09',5,6,5,3,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-10',5,11,6,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-11',13,9,5,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-12',6,6,4,3,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-13',5,8,5,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (24,'2026-11-14',5,5,5,7,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-01',9,13,8,11,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-02',12,12,8,11,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-03',8,12,6,12,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-04',9,11,6,9,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-05',2,6,5,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-06',11,2,7,12,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-07',3,11,7,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-08',3,7,10,11,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-09',11,11,9,12,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-10',7,3,6,11,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-11',2,5,6,11,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-12',12,2,6,11,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-13',11,11,9,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (25,'2026-11-14',10,12,9,10,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-01',6,9,7,6,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-02',12,3,7,10,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-03',4,7,6,10,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-04',13,8,4,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-05',14,13,5,7,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-06',7,3,6,6,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-07',5,2,6,7,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-08',2,4,6,11,6);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-09',6,3,9,9,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-10',14,7,9,9,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-11',4,7,8,9,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-12',5,13,5,7,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-13',3,11,6,11,5);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (26,'2026-11-14',13,8,8,11,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-01',13,13,2,5,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-02',3,8,1,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-03',14,13,0,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-04',4,11,1,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-05',13,4,2,4,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-06',4,12,3,7,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-07',4,3,4,7,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-08',3,5,3,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-09',12,5,0,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-10',14,5,2,8,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-11',7,3,2,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-12',6,4,4,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-13',10,7,0,8,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (27,'2026-11-14',10,4,5,6,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-01',9,5,8,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-02',11,7,8,7,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-03',8,13,8,7,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-04',3,3,7,7,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-05',7,11,5,3,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-06',14,4,10,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-07',7,7,7,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-08',13,11,7,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-09',7,8,6,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-10',11,9,8,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-11',6,9,9,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-12',8,5,10,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-13',8,9,10,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (28,'2026-11-14',2,3,10,6,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-01',4,3,4,5,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-02',10,12,6,4,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-03',12,11,8,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-04',10,6,8,4,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-05',5,13,5,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-06',7,12,5,7,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-07',10,9,7,4,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-08',13,4,7,6,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-09',5,8,6,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-10',7,8,5,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-11',7,5,8,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-12',11,12,5,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-13',11,12,6,4,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (29,'2026-11-14',13,3,6,8,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-01',4,10,3,1,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-02',8,7,3,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-03',11,9,4,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-04',14,8,3,1,0);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-05',13,7,3,4,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-06',6,4,4,5,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-07',3,8,6,2,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-08',14,3,2,5,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-09',2,8,5,1,3);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-10',7,4,3,2,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-11',9,12,2,5,1);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-12',11,9,6,2,4);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-13',3,5,6,1,2);
+
+INSERT INTO dbo.DailyLockerMetrics (LockerID,MetricDate,ParcelsReceived,ParcelsCollected,OccupiedSmall,OccupiedMedium,OccupiedLarge) VALUES (30,'2026-11-14',5,4,5,4,5);
+
+INSERT INTO dbo.ForecastRun (ModelName,ModelVersion,ForecastHorizonDays,DataThroughDate)
+VALUES (N'Demo baseline',N'1.0',7,'2026-11-14');
+
+-- Seed one illustrative forecast for each locker.
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,1,'2026-11-15',11,13,10,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,2,'2026-11-15',16,17,12,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,3,'2026-11-15',12,17,9,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,4,'2026-11-15',14,14,7,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,5,'2026-11-15',11,4,9,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,6,'2026-11-15',18,11,7,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,7,'2026-11-15',12,12,8,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,8,'2026-11-15',13,6,4,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,9,'2026-11-15',8,11,5,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,10,'2026-11-15',11,13,2,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,11,'2026-11-15',7,10,4,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,12,'2026-11-15',11,9,2,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,13,'2026-11-15',14,13,2,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,14,'2026-11-15',7,9,4,N'Low');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,15,'2026-11-15',6,5,6,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,16,'2026-11-15',9,7,6,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,17,'2026-11-15',7,10,7,N'High');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,18,'2026-11-15',6,10,4,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,19,'2026-11-15',7,7,0,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,20,'2026-11-15',5,8,3,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,21,'2026-11-15',8,14,7,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,22,'2026-11-15',13,9,3,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,23,'2026-11-15',9,5,3,N'Low');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,24,'2026-11-15',7,4,3,N'Medium');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,25,'2026-11-15',13,15,8,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,26,'2026-11-15',7,12,8,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,27,'2026-11-15',8,9,1,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,28,'2026-11-15',7,6,0,N'Low');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,29,'2026-11-15',5,10,3,N'Critical');
+
+INSERT INTO dbo.LockerForecast (ForecastRunID,LockerID,ForecastDate,PredictedSmallOccupancy,PredictedMediumOccupancy,PredictedLargeOccupancy,RiskLevel) VALUES (1,30,'2026-11-15',9,5,5,N'Critical');
+
+INSERT INTO dbo.Recommendation (ForecastRunID,LockerID,RecommendationText,Priority)
+SELECT 1, LockerID, N'Review incoming parcel allocation and nearby compatible compartment availability.', N'Medium'
+FROM dbo.Locker
+WHERE LockerID IN (1,3,13,21);
+
+
+-- Live capacity view: occupancy is derived from current AtLocker parcels.
+-- Utilisation is calculated overall and separately for each compartment size.
+EXEC(N'
+CREATE VIEW dbo.v_LockerCurrentCapacity
+AS
+SELECT
+ l.LockerID, l.LockerCode, l.LockerName, r.RegionName,
+ SUM(CASE WHEN c.CompartmentSize=''Small'' THEN c.TotalCompartments ELSE 0 END) AS TotalSmall,
+ SUM(CASE WHEN c.CompartmentSize=''Medium'' THEN c.TotalCompartments ELSE 0 END) AS TotalMedium,
+ SUM(CASE WHEN c.CompartmentSize=''Large'' THEN c.TotalCompartments ELSE 0 END) AS TotalLarge,
+ SUM(CASE WHEN c.CompartmentSize=''Small'' THEN ISNULL(o.Occupied,0) ELSE 0 END) AS OccupiedSmall,
+ SUM(CASE WHEN c.CompartmentSize=''Medium'' THEN ISNULL(o.Occupied,0) ELSE 0 END) AS OccupiedMedium,
+ SUM(CASE WHEN c.CompartmentSize=''Large'' THEN ISNULL(o.Occupied,0) ELSE 0 END) AS OccupiedLarge,
+ CAST(
+   100.0 * SUM(CASE WHEN c.CompartmentSize=''Small'' THEN ISNULL(o.Occupied,0) ELSE 0 END)
+   / NULLIF(SUM(CASE WHEN c.CompartmentSize=''Small'' THEN c.TotalCompartments ELSE 0 END),0)
+   AS DECIMAL(5,2)
+ ) AS SmallUtilisationPercent,
+ CAST(
+   100.0 * SUM(CASE WHEN c.CompartmentSize=''Medium'' THEN ISNULL(o.Occupied,0) ELSE 0 END)
+   / NULLIF(SUM(CASE WHEN c.CompartmentSize=''Medium'' THEN c.TotalCompartments ELSE 0 END),0)
+   AS DECIMAL(5,2)
+ ) AS MediumUtilisationPercent,
+ CAST(
+   100.0 * SUM(CASE WHEN c.CompartmentSize=''Large'' THEN ISNULL(o.Occupied,0) ELSE 0 END)
+   / NULLIF(SUM(CASE WHEN c.CompartmentSize=''Large'' THEN c.TotalCompartments ELSE 0 END),0)
+   AS DECIMAL(5,2)
+ ) AS LargeUtilisationPercent,
+ SUM(c.TotalCompartments) AS TotalCompartments,
+ SUM(ISNULL(o.Occupied,0)) AS OccupiedCompartments,
+ SUM(c.TotalCompartments)-SUM(ISNULL(o.Occupied,0)) AS AvailableCompartments,
+ CAST(100.0*SUM(ISNULL(o.Occupied,0))/NULLIF(SUM(c.TotalCompartments),0) AS DECIMAL(5,2)) AS UtilisationPercent
+FROM dbo.Locker l
+JOIN dbo.Region r ON r.RegionID=l.RegionID
+JOIN dbo.LockerCompartment c ON c.LockerID=l.LockerID
+LEFT JOIN (
+ SELECT CurrentLockerID, ParcelSize, COUNT(*) AS Occupied
+ FROM dbo.Parcel
+ WHERE Status=''AtLocker''
+ GROUP BY CurrentLockerID, ParcelSize
+) o ON o.CurrentLockerID=c.LockerID AND o.ParcelSize=c.CompartmentSize
+GROUP BY l.LockerID,l.LockerCode,l.LockerName,r.RegionName;
+');
+
+
+
+-- Live transfer-candidate view.
+-- Distances are estimates from synthetic coordinates, not road-routing data.
+-- Estimated cost is one-way and uses the editable TransportCostSettings row.
+EXEC(N'
+CREATE VIEW dbo.v_TransferCandidates
+AS
+SELECT
+ p.ParcelID,
+ p.ParcelCode,
+ p.ParcelSize,
+ p.CurrentLockerID AS SourceLockerID,
+ src.LockerCode AS SourceLockerCode,
+ src.LockerName AS SourceLockerName,
+ dst.LockerID AS DestinationLockerID,
+ dst.LockerCode AS DestinationLockerCode,
+ dst.LockerName AS DestinationLockerName,
+ CASE p.ParcelSize
+   WHEN ''Small'' THEN dst.TotalSmall - dst.OccupiedSmall
+   WHEN ''Medium'' THEN dst.TotalMedium - dst.OccupiedMedium
+   WHEN ''Large'' THEN dst.TotalLarge - dst.OccupiedLarge
+ END AS AvailableMatchingCompartments,
+ CASE p.ParcelSize
+   WHEN ''Small'' THEN src.SmallUtilisationPercent
+   WHEN ''Medium'' THEN src.MediumUtilisationPercent
+   WHEN ''Large'' THEN src.LargeUtilisationPercent
+ END AS SourceSizeUtilisationPercent,
+ CASE p.ParcelSize
+   WHEN ''Small'' THEN dst.SmallUtilisationPercent
+   WHEN ''Medium'' THEN dst.MediumUtilisationPercent
+   WHEN ''Large'' THEN dst.LargeUtilisationPercent
+ END AS DestinationSizeUtilisationPercent,
+ src.UtilisationPercent AS SourceOverallUtilisationPercent,
+ dst.UtilisationPercent AS DestinationOverallUtilisationPercent,
+ CAST(2.0 * 6371.0 * ASIN(SQRT(
+   POWER(SIN(RADIANS(dstLocker.Latitude - srcLocker.Latitude) / 2.0), 2)
+   + COS(RADIANS(srcLocker.Latitude)) * COS(RADIANS(dstLocker.Latitude))
+   * POWER(SIN(RADIANS(dstLocker.Longitude - srcLocker.Longitude) / 2.0), 2)
+ )) AS DECIMAL(10,2)) AS StraightLineDistanceKm,
+ CAST(
+   (2.0 * 6371.0 * ASIN(SQRT(
+     POWER(SIN(RADIANS(dstLocker.Latitude - srcLocker.Latitude) / 2.0), 2)
+     + COS(RADIANS(srcLocker.Latitude)) * COS(RADIANS(dstLocker.Latitude))
+     * POWER(SIN(RADIANS(dstLocker.Longitude - srcLocker.Longitude) / 2.0), 2)
+   ))) * settings.RoadDistanceFactor
+   AS DECIMAL(10,2)
+ ) AS EstimatedRoadDistanceKm,
+ CAST(
+   settings.FixedHandlingCostEUR
+   + (2.0 * 6371.0 * ASIN(SQRT(
+       POWER(SIN(RADIANS(dstLocker.Latitude - srcLocker.Latitude) / 2.0), 2)
+       + COS(RADIANS(srcLocker.Latitude)) * COS(RADIANS(dstLocker.Latitude))
+       * POWER(SIN(RADIANS(dstLocker.Longitude - srcLocker.Longitude) / 2.0), 2)
+     ))) * settings.RoadDistanceFactor * settings.CostPerKmEUR
+   AS DECIMAL(10,2)
+ ) AS EstimatedTransportCostEUR
+FROM dbo.Parcel p
+JOIN dbo.Locker srcLocker ON srcLocker.LockerID = p.CurrentLockerID
+JOIN dbo.v_LockerCurrentCapacity src ON src.LockerID = srcLocker.LockerID
+CROSS JOIN dbo.Locker dstLocker
+JOIN dbo.v_LockerCurrentCapacity dst ON dst.LockerID = dstLocker.LockerID
+CROSS JOIN dbo.TransportCostSettings settings
+WHERE p.Status = ''AtLocker''
+  AND dstLocker.IsActive = 1
+  AND dstLocker.LockerID <> srcLocker.LockerID
+  AND srcLocker.Latitude IS NOT NULL
+  AND srcLocker.Longitude IS NOT NULL
+  AND dstLocker.Latitude IS NOT NULL
+  AND dstLocker.Longitude IS NOT NULL
+  AND CASE p.ParcelSize
+        WHEN ''Small'' THEN dst.TotalSmall - dst.OccupiedSmall
+        WHEN ''Medium'' THEN dst.TotalMedium - dst.OccupiedMedium
+        WHEN ''Large'' THEN dst.TotalLarge - dst.OccupiedLarge
+      END > 0;
+');
+
+
+
+
+/* =========================================================================
+   SYNTHETIC 75% NETWORK UTILISATION SCENARIO
+   This section adjusts the standalone seed data after all base tables and
+   views have been created. It adds synthetic AtLocker parcels, corresponding
+   movement history, updates the latest daily metrics, and creates a matching
+   demo forecast and recommendations.
+   Target profile: 5 high-pressure lockers, 8 lower-utilisation lockers,
+   and the remaining lockers around 70-78%.
+   All additions are fictional demonstration data, not Latvijas Pasts data.
+   ========================================================================= */
+
+SET NOCOUNT ON;
+
+IF EXISTS (SELECT 1 FROM dbo.Parcel WHERE ParcelCode LIKE N'LP-DEMO75-%')
+    THROW 51020, 'The LP-DEMO75 seed scenario already exists. Do not run this standalone build twice in the same database.', 1;
+
+DECLARE @ScenarioDate DATE = '2026-11-14';
+DECLARE @ForecastDate DATE = '2026-11-15';
+
+CREATE TABLE #LockerTargets
+(
+    LockerID INT NOT NULL PRIMARY KEY,
+    TargetUtilisation DECIMAL(5,2) NOT NULL
+);
+
+INSERT INTO #LockerTargets (LockerID, TargetUtilisation)
+SELECT l.LockerID,
+       CASE
+           WHEN l.LockerID = 1 THEN 0.96
+           WHEN l.LockerID = 2 THEN 0.93
+           WHEN l.LockerID = 3 THEN 0.90
+           WHEN l.LockerID = 4 THEN 0.88
+           WHEN l.LockerID = 5 THEN 0.90
+           WHEN l.LockerID BETWEEN 6 AND 15 THEN 0.78
+           WHEN l.LockerID BETWEEN 16 AND 23 THEN 0.60
+           ELSE 0.70
+       END
+FROM dbo.Locker AS l
+WHERE l.IsActive = 1;
+
+CREATE TABLE #Needed
+(
+    LockerID INT NOT NULL,
+    ParcelSize NVARCHAR(10) NOT NULL,
+    NeededCount INT NOT NULL,
+    PRIMARY KEY (LockerID, ParcelSize)
+);
+
+;WITH CapacityBySize AS
+(
+    SELECT lc.LockerID, lc.CompartmentSize, lc.TotalCompartments,
+           COALESCE(oc.OccupiedCount, 0) AS OccupiedCount,
+           t.TargetUtilisation
+    FROM dbo.LockerCompartment AS lc
+    JOIN #LockerTargets AS t ON t.LockerID = lc.LockerID
+    OUTER APPLY
+    (
+        SELECT COUNT(*) AS OccupiedCount
+        FROM dbo.Parcel AS p
+        WHERE p.Status = N'AtLocker'
+          AND p.CurrentLockerID = lc.LockerID
+          AND p.ParcelSize = lc.CompartmentSize
+    ) AS oc
+)
+INSERT INTO #Needed (LockerID, ParcelSize, NeededCount)
+SELECT LockerID, CompartmentSize,
+       CASE
+           WHEN CEILING(TotalCompartments * TargetUtilisation) > OccupiedCount
+           THEN CONVERT(INT, CEILING(TotalCompartments * TargetUtilisation) - OccupiedCount)
+           ELSE 0
+       END
+FROM CapacityBySize
+WHERE TotalCompartments > 0;
+
+CREATE TABLE #NewParcels
+(
+    ParcelCode NVARCHAR(30) NOT NULL PRIMARY KEY,
+    ParcelSize NVARCHAR(10) NOT NULL,
+    LockerID INT NOT NULL,
+    DestinationRegionID INT NOT NULL,
+    CreatedAt DATETIME2 NOT NULL
+);
+
+;WITH Numbers AS
+(
+    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+    FROM sys.all_objects AS a
+    CROSS JOIN sys.all_objects AS b
+),
+Expanded AS
+(
+    SELECT n.LockerID, n.ParcelSize, n.DestinationRegionID, nums.n,
+           ROW_NUMBER() OVER (ORDER BY n.LockerID, n.ParcelSize, nums.n) AS GlobalRow
+    FROM
+    (
+        SELECT nd.LockerID, nd.ParcelSize, nd.NeededCount,
+               l.RegionID AS DestinationRegionID
+        FROM #Needed AS nd
+        JOIN dbo.Locker AS l ON l.LockerID = nd.LockerID
+        WHERE nd.NeededCount > 0
+    ) AS n
+    CROSS APPLY
+    (
+        SELECT Numbers.n
+        FROM Numbers
+        WHERE Numbers.n <= n.NeededCount
+    ) AS nums
+)
+INSERT INTO #NewParcels (ParcelCode, ParcelSize, LockerID, DestinationRegionID, CreatedAt)
+SELECT N'LP-DEMO75-' + RIGHT(N'000000' + CONVERT(NVARCHAR(6), GlobalRow), 6),
+       ParcelSize, LockerID, DestinationRegionID,
+       DATEADD(MINUTE, CONVERT(INT, GlobalRow % 600), CONVERT(DATETIME2, @ScenarioDate))
+FROM Expanded;
+
+INSERT INTO dbo.Parcel
+(ParcelCode, ParcelSize, CreatedAt, ExpectedDeliveryAt, DeliveredAt, CollectedAt,
+ Status, CurrentLockerID, DestinationRegionID, LastStatusAt)
+SELECT ParcelCode, ParcelSize, CreatedAt, DATEADD(DAY, 2, CreatedAt),
+       CreatedAt, NULL, N'AtLocker', LockerID, DestinationRegionID, CreatedAt
+FROM #NewParcels;
+
+INSERT INTO dbo.ParcelMovement
+(ParcelID, FromLockerID, ToLockerID, EventType, EventAt, Notes)
+SELECT p.ParcelID, NULL, p.CurrentLockerID, N'Loaded', p.LastStatusAt,
+       N'Synthetic 75% utilisation demonstration scenario'
+FROM dbo.Parcel AS p
+JOIN #NewParcels AS np ON np.ParcelCode = p.ParcelCode;
+
+-- Bring the latest available daily snapshot in line with current parcel counts.
+;WITH CurrentCounts AS
+(
+    SELECT CurrentLockerID AS LockerID,
+           SUM(CASE WHEN ParcelSize = N'Small' THEN 1 ELSE 0 END) AS SmallCount,
+           SUM(CASE WHEN ParcelSize = N'Medium' THEN 1 ELSE 0 END) AS MediumCount,
+           SUM(CASE WHEN ParcelSize = N'Large' THEN 1 ELSE 0 END) AS LargeCount
+    FROM dbo.Parcel
+    WHERE Status = N'AtLocker'
+    GROUP BY CurrentLockerID
+),
+LatestMetric AS
+(
+    SELECT LockerID, MAX(MetricDate) AS MetricDate
+    FROM dbo.DailyLockerMetrics
+    GROUP BY LockerID
+)
+UPDATE dm
+SET OccupiedSmall = COALESCE(cc.SmallCount, 0),
+    OccupiedMedium = COALESCE(cc.MediumCount, 0),
+    OccupiedLarge = COALESCE(cc.LargeCount, 0)
+FROM dbo.DailyLockerMetrics AS dm
+JOIN LatestMetric AS lm
+  ON lm.LockerID = dm.LockerID AND lm.MetricDate = dm.MetricDate
+LEFT JOIN CurrentCounts AS cc ON cc.LockerID = dm.LockerID;
+
+-- Add a forecast explicitly labelled as a synthetic scenario, not a model prediction.
+INSERT INTO dbo.ForecastRun (ModelName, ModelVersion, ForecastHorizonDays, DataThroughDate)
+VALUES (N'Synthetic 75% capacity scenario (not a statistical forecast)',
+        N'demo-75pct-v1', 1, @ScenarioDate);
+
+DECLARE @ScenarioForecastRunID INT = SCOPE_IDENTITY();
+
+INSERT INTO dbo.LockerForecast
+(ForecastRunID, LockerID, ForecastDate,
+ PredictedSmallOccupancy, PredictedMediumOccupancy, PredictedLargeOccupancy, RiskLevel)
+SELECT @ScenarioForecastRunID, cap.LockerID, @ForecastDate,
+       cap.OccupiedSmall, cap.OccupiedMedium, cap.OccupiedLarge,
+       CASE
+           WHEN cap.UtilisationPercent >= 95 THEN N'Critical'
+           WHEN cap.UtilisationPercent >= 85 THEN N'High'
+           WHEN cap.UtilisationPercent >= 65 THEN N'Medium'
+           ELSE N'Low'
+       END
+FROM dbo.v_LockerCurrentCapacity AS cap;
+
+INSERT INTO dbo.Recommendation
+(ForecastRunID, LockerID, RecommendationText, Priority, Status)
+SELECT @ScenarioForecastRunID, cap.LockerID,
+       N'High occupancy: review collection incentives and consider transferring eligible parcels to nearby lockers with available matching-size compartments.',
+       CASE WHEN cap.UtilisationPercent >= 95 THEN N'Critical' ELSE N'High' END,
+       N'Pending'
+FROM dbo.v_LockerCurrentCapacity AS cap
+WHERE cap.UtilisationPercent >= 85;
+
+-- Guardrail: no size-specific compartment capacity may be exceeded.
+IF EXISTS
+(
+    SELECT 1
+    FROM dbo.v_LockerCurrentCapacity
+    WHERE OccupiedSmall > TotalSmall
+       OR OccupiedMedium > TotalMedium
+       OR OccupiedLarge > TotalLarge
+)
+    THROW 51021, '75% scenario validation failed: at least one compartment-size capacity was exceeded.', 1;
+
+DROP TABLE #NewParcels;
+DROP TABLE #Needed;
+DROP TABLE #LockerTargets;
+
+
+-- Validation: expected 30 lockers and approximately 75% network utilisation after the scenario additions.
+SELECT COUNT(*) AS ParcelCount FROM dbo.Parcel;
+SELECT COUNT(*) AS LockerCount FROM dbo.Locker;
+SELECT
+ LockerCode, LockerName, RegionName,
+ TotalSmall, OccupiedSmall, SmallUtilisationPercent,
+ TotalMedium, OccupiedMedium, MediumUtilisationPercent,
+ TotalLarge, OccupiedLarge, LargeUtilisationPercent,
+ TotalCompartments, OccupiedCompartments, AvailableCompartments,
+ UtilisationPercent
+FROM dbo.v_LockerCurrentCapacity
+ORDER BY UtilisationPercent DESC;
+SELECT Status, COUNT(*) AS ParcelCount FROM dbo.Parcel GROUP BY Status ORDER BY Status;
+
+SELECT
+    ParcelID, ParcelCode, ParcelSize,
+    SourceLockerCode, DestinationLockerCode,
+    AvailableMatchingCompartments,
+    SourceSizeUtilisationPercent, DestinationSizeUtilisationPercent,
+    StraightLineDistanceKm, EstimatedRoadDistanceKm,
+    EstimatedTransportCostEUR
+FROM dbo.v_TransferCandidates
+ORDER BY
+    (SourceSizeUtilisationPercent - DestinationSizeUtilisationPercent) DESC,
+    EstimatedTransportCostEUR ASC;
+SELECT * FROM dbo.TransportCostSettings;
